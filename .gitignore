@@ -1,0 +1,32 @@
+# 依存パッケージ
+node_modules/
+
+# 環境変数（機密情報を含むためコミット禁止）
+.env
+*.env.local
+
+# サービスアカウントキー（絶対にコミットしないこと）
+*.json
+!package.json
+!package-lock.json
+
+# Playwright のブラウザキャッシュ（ローカル）
+.playwright/
+
+# ログファイル
+*.log
+logs/
+
+# OS ファイル
+.DS_Store
+Thumbs.db
+
+# エディタ設定
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ビルド成果物
+dist/
+build/

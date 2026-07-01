@@ -1,0 +1,90 @@
+# ============================================================
+# sagawa-monitor / cloudbuild.yaml
+# Cloud Build → Cloud Run 自動デプロイ設定
+#
+# 必要な Cloud Build サービスアカウント権限:
+#   - roles/run.admin
+#   - roles/iam.serviceAccountUser
+#   - roles/artifactregistry.writer（Artifact Registry 使用時）
+#   - roles/storage.admin（Container Registry 使用時）
+# ============================================================
+
+substitutions:
+  _SERVICE_NAME: sagawa-monitor
+  _REGION: asia-northeast1          # 東京リージョン
+  _IMAGE: gcr.io/$PROJECT_ID/sagawa-monitor
+
+steps:
+  # ── Step 1: Docker イメージをビルド ─────────────────────────────────────────
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'build-image'
+    args:
+      - 'build'
+      - '--tag'
+      - '${_IMAGE}:$SHORT_SHA'
+      - '--tag'
+      - '${_IMAGE}:latest'
+      - '--cache-from'
+      - '${_IMAGE}:latest'
+      - '.'
+    timeout: '1200s'  # Playwright のダウンロードに時間がかかるため長めに設定
+
+  # ── Step 2: イメージを Container Registry へプッシュ ────────────────────────
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'push-image'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_IMAGE}'
+    waitFor: ['build-image']
+
+  # ── Step 3: Cloud Run へデプロイ ─────────────────────────────────────────────
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'deploy-cloudrun'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE_NAME}'
+      - '--image'
+      - '${_IMAGE}:$SHORT_SHA'
+      - '--region'
+      - '${_REGION}'
+      - '--platform'
+      - 'managed'
+      # メモリ: Playwright + Chromium は最低 1GB 必要
+      - '--memory'
+      - '2Gi'
+      # CPU: スクレイピング中は CPU をフル使用するため 2 以上推奨
+      - '--cpu'
+      - '2'
+      # リクエストタイムアウト（佐川サイトへのアクセス時間を考慮）
+      - '--timeout'
+      - '3600'
+      # 同時実行数を 1 に設定（Playwright は並列実行しない）
+      - '--concurrency'
+      - '1'
+      # 最小インスタンス数 0（コスト削減）
+      - '--min-instances'
+      - '0'
+      # 最大インスタンス数 1（同時実行を防ぐ）
+      - '--max-instances'
+      - '1'
+      # 環境変数は Secret Manager から注入するため --set-env-vars は最小限
+      - '--set-env-vars'
+      - 'NODE_ENV=production'
+      # 未認証アクセスを禁止（Cloud Scheduler はサービスアカウントで認証）
+      - '--no-allow-unauthenticated'
+    waitFor: ['push-image']
+
+# ── ビルド成果物 ─────────────────────────────────────────────────────────────
+images:
+  - '${_IMAGE}:$SHORT_SHA'
+  - '${_IMAGE}:latest'
+
+# ── タイムアウト設定 ──────────────────────────────────────────────────────────
+timeout: '1800s'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'  # ビルドを高速化
