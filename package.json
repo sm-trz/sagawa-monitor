@@ -2,15 +2,17 @@
   "name": "sagawa-monitor",
   "version": "1.0.0",
   "description": "佐川急便 配送状況監視システム",
-  "main": "src/index.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node src/index.js",
-    "test": "node src/test.js"
+    "start": "node index.js",
+    "dev": "node index.js",
+    "test": "node test.js"
   },
   "dependencies": {
-    "playwright": "^1.44.0",
-    "googleapis": "^140.0.0",
+    "playwright": "1.61.1",
+    "googleapis": "^173.0.0",
+    "google-auth-library": "^10.9.0",
+    "gaxios": "^7.1.5",
     "dotenv": "^16.4.5",
     "winston": "^3.13.0"
   },
