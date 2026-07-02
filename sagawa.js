@@ -2,13 +2,18 @@
  * sagawa-monitor / src/sagawa.js
  * Playwright で佐川急便の荷物問い合わせページをスクレイピングする
  *
- * 対象URL: https://k2k.sagawa-exp.co.jp/p/web/okurijosearch.do
+ * Cloud Run 安定化のための対応:
+ *   - --single-process / --disable-gpu を削除（GPU プロセス通信エラーの原因）
+ *   - ブラウザは実行全体で1インスタンスのみ起動
+ *   - 伝票ごとに newContext() → newPage() → close() を try/finally で確実に実施
+ *   - ブラウザが死んでいたら再起動して最大1回リトライ
+ *   - 1件失敗しても次の伝票へ進む
  */
 
 const { chromium } = require('playwright');
 const logger = require('./logger');
 
-// 判定するステータス一覧（優先度順）
+// ── ステータス定義 ──────────────────────────────────────────────────────────
 const STATUS_KEYWORDS = [
   { label: '受取拒否', keywords: ['受取拒否'] },
   { label: '受取辞退', keywords: ['受取辞退'] },
@@ -23,166 +28,188 @@ const STATUS_KEYWORDS = [
   { label: '集荷',     keywords: ['集荷'] },
 ];
 
-// 返品系ステータス
 const RETURN_STATUSES = new Set(['受取拒否', '受取辞退', '返送', '返品', '長期不在', '持戻り']);
 
-/**
- * ステータス文字列からラベルを判定する
- * @param {string} rawText - ページから取得した生テキスト
- * @returns {string} - 判定済みステータスラベル
- */
 function classifyStatus(rawText) {
   if (!rawText) return '不明';
-
   for (const { label, keywords } of STATUS_KEYWORDS) {
     for (const kw of keywords) {
-      if (rawText.includes(kw)) {
-        return label;
-      }
+      if (rawText.includes(kw)) return label;
     }
   }
   return '不明';
 }
 
-/**
- * ステータスが返品系かどうか判定する
- * @param {string} status
- * @returns {boolean}
- */
 function isReturnStatus(status) {
   return RETURN_STATUSES.has(status);
 }
 
+// ── Chromium 起動オプション ─────────────────────────────────────────────────
+// --single-process : GPU コマンドバッファ通信エラー（signal 5）の原因になるため削除
+// --disable-gpu    : GPU プロセス自体を無効化すると逆に IPC エラーが起きるため削除
+//                    代わりに --disable-software-rasterizer で GPU 描画をスキップ
+const CHROMIUM_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',       // /dev/shm が小さい Cloud Run 環境対策
+  '--disable-software-rasterizer', // ソフトウェア GPU レンダラを無効化（GPU プロセスは立てない）
+  '--no-first-run',
+  '--no-zygote',                   // zygote プロセスを使わない（コンテナ環境向け）
+  '--disable-extensions',
+  '--disable-background-networking',
+  '--disable-default-apps',
+  '--mute-audio',
+];
+
+// ── ブラウザ起動ヘルパー ────────────────────────────────────────────────────
+async function launchBrowser() {
+  const browser = await chromium.launch({ headless: true, args: CHROMIUM_ARGS });
+  logger.info('Chromium を起動しました');
+  return browser;
+}
+
+/**
+ * ブラウザが生きているか確認する
+ * connected() が false ならクラッシュ済みと判断
+ */
+function isBrowserAlive(browser) {
+  try {
+    return browser.isConnected();
+  } catch (_) {
+    return false;
+  }
+}
+
+// ── 1件スクレイピング ───────────────────────────────────────────────────────
 /**
  * 佐川急便の荷物問い合わせページから配送状況を取得する
- * @param {string} trackingNo - 伝票番号（10桁または12桁）
- * @param {import('playwright').Browser} browser - 再利用するブラウザインスタンス
- * @returns {{ rawText: string, status: string, isReturn: boolean }}
+ * context / page は呼び出し側で管理せず、この関数内で完結させる
+ *
+ * @param {string} trackingNo
+ * @param {import('playwright').Browser} browser
+ * @returns {{ status: string, isReturn: boolean }}
  */
 async function fetchDeliveryStatus(trackingNo, browser) {
   const url = `https://k2k.sagawa-exp.co.jp/p/web/okurijosearch.do?okurijoNo=${encodeURIComponent(trackingNo)}`;
-
   logger.info(`配送状況を取得中: ${trackingNo}`);
 
-  const context = await browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    locale: 'ja-JP',
-    timezoneId: 'Asia/Tokyo',
-  });
-
-  const page = await context.newPage();
+  // context・page を確実に close するため変数を外で宣言
+  let context = null;
+  let page    = null;
 
   try {
-    // ページ遷移（JavaScript 実行後のコンテンツを待つため waitUntil: networkidle）
-    await page.goto(url, {
-      waitUntil: 'networkidle',
-      timeout: 30000,
+    context = await browser.newContext({
+      userAgent:  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      locale:     'ja-JP',
+      timezoneId: 'Asia/Tokyo',
     });
 
-    // ページが完全にレンダリングされるまで待機
+    page = await context.newPage();
+
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
     await page.waitForTimeout(2000);
 
-    // ----- ステータステキストの抽出 -----
-    // 佐川のページ構造に応じて複数のセレクタを試みる
+    // ステータステキストの抽出（複数セレクタを試みる）
     let rawText = '';
-
-    // 方法1: 輸送状況テーブル全体のテキストを取得
     const tableSelectors = [
-      '.tbl-okurijyoSearch',          // 一般的なステータステーブル
-      '.wr-okurijyo',                  // 荷物詳細エリア
-      '#result',                       // 結果エリア
-      '.resultArea',                   // 結果エリア（別パターン）
-      'table',                         // フォールバック: 最初のテーブル
+      '.tbl-okurijyoSearch',
+      '.wr-okurijyo',
+      '#result',
+      '.resultArea',
+      'table',
     ];
 
     for (const selector of tableSelectors) {
       try {
         const el = await page.$(selector);
         if (el) {
-          rawText = await el.innerText();
-          if (rawText && rawText.trim().length > 0) {
+          const t = await el.innerText();
+          if (t && t.trim().length > 0) {
+            rawText = t;
             logger.debug(`セレクタ "${selector}" でテキストを取得`, { preview: rawText.slice(0, 200) });
             break;
           }
         }
-      } catch (_) {
-        // セレクタが見つからない場合は次を試す
-      }
+      } catch (_) { /* 次のセレクタを試す */ }
     }
 
-    // フォールバック: ページ全体のテキストを取得
+    // フォールバック: ページ全体テキスト
     if (!rawText || rawText.trim().length === 0) {
       rawText = await page.evaluate(() => document.body.innerText);
       logger.debug('フォールバック: ページ全体テキストを使用');
     }
 
-    // 「お問い合わせ番号が見つかりません」などのエラーページ判定
+    // 伝票不明判定
     if (
       rawText.includes('お問い合わせ番号が見つかりません') ||
       rawText.includes('該当する荷物が見つかりません') ||
       rawText.includes('No data')
     ) {
       logger.warn(`伝票番号 ${trackingNo} が見つかりませんでした`);
-      return { rawText: '', status: '伝票不明', isReturn: false };
+      return { status: '伝票不明', isReturn: false };
     }
 
-    const status = classifyStatus(rawText);
+    const status   = classifyStatus(rawText);
     const isReturn = isReturnStatus(status);
-
     logger.info(`ステータス判定完了: ${trackingNo} → ${status}`, { isReturn });
+    return { status, isReturn };
 
-    return { rawText, status, isReturn };
-  } catch (err) {
-    logger.error(`ページ取得エラー: ${trackingNo}`, { error: err.message });
-    return { rawText: '', status: 'エラー', isReturn: false };
   } finally {
-    await page.close();
-    await context.close();
+    // page → context の順で確実に close（エラーが出ても飲み込む）
+    if (page) {
+      try { await page.close(); } catch (e) {
+        logger.debug(`page.close() エラー（無視）: ${e.message}`);
+      }
+    }
+    if (context) {
+      try { await context.close(); } catch (e) {
+        logger.debug(`context.close() エラー（無視）: ${e.message}`);
+      }
+    }
   }
 }
 
+// ── 全件一括取得 ────────────────────────────────────────────────────────────
 /**
- * 複数の伝票番号の配送状況を一括取得する
  * @param {Array<{ trackingNo: string }>} rows
  * @returns {Array<{ trackingNo: string, status: string, isReturn: boolean }>}
  */
 async function fetchAllStatuses(rows) {
-  // ブラウザを1インスタンスだけ起動して使い回す
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process', // Cloud Run のメモリ制限対策
-      '--disable-extensions',
-    ],
-  });
+  if (rows.length === 0) return [];
 
-  logger.info(`ブラウザを起動しました。対象件数: ${rows.length}`);
-
+  let browser = await launchBrowser();
   const results = [];
 
   try {
     for (const row of rows) {
+      // ブラウザが死んでいたら再起動（1件目クラッシュからの復旧）
+      if (!isBrowserAlive(browser)) {
+        logger.warn('ブラウザがクラッシュしています。再起動します');
+        try { await browser.close(); } catch (_) {}
+        browser = await launchBrowser();
+      }
+
       try {
         const result = await fetchDeliveryStatus(row.trackingNo, browser);
         results.push({ trackingNo: row.trackingNo, ...result });
       } catch (err) {
-        logger.error(`伝票 ${row.trackingNo} の処理中にエラー`, { error: err.message });
-        results.push({ trackingNo: row.trackingNo, rawText: '', status: 'エラー', isReturn: false });
+        // 1件失敗しても次の伝票へ進む
+        logger.error(`伝票 ${row.trackingNo} の処理中にエラー（スキップ）`, { error: err.message });
+        results.push({ trackingNo: row.trackingNo, status: 'エラー', isReturn: false });
       }
 
-      // 連続アクセスによるブロック回避のため少し待機
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      // 連続アクセスによるブロック回避
+      if (row !== rows[rows.length - 1]) {
+        await new Promise((r) => setTimeout(r, 2000));
+      }
     }
   } finally {
-    await browser.close();
-    logger.info('ブラウザを閉じました');
+    try {
+      await browser.close();
+      logger.info('ブラウザを閉じました');
+    } catch (e) {
+      logger.warn(`browser.close() エラー（無視）: ${e.message}`);
+    }
   }
 
   return results;
