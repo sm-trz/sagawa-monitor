@@ -1,5 +1,5 @@
 /**
- * sagawa-monitor / src/sagawa.js
+ * sagawa-monitor / sagawa.js
  * Playwright で佐川急便の荷物問い合わせページをスクレイピングする
  */
 
@@ -20,15 +20,24 @@ const STATUS_KEYWORDS = [
   { label: '集荷', keywords: ['集荷'] },
 ];
 
-const RETURN_STATUSES = new Set(['受取拒否', '受取辞退', '返送', '返品', '長期不在', '持戻り']);
+const RETURN_STATUSES = new Set([
+  '受取拒否',
+  '受取辞退',
+  '返送',
+  '返品',
+  '長期不在',
+  '持戻り',
+]);
 
 function classifyStatus(rawText) {
   if (!rawText) return '不明';
+
   for (const { label, keywords } of STATUS_KEYWORDS) {
     for (const kw of keywords) {
       if (rawText.includes(kw)) return label;
     }
   }
+
   return '不明';
 }
 
@@ -50,14 +59,18 @@ const CHROMIUM_ARGS = [
 ];
 
 async function launchBrowser() {
-  const browser = await chromium.launch({ headless: true, args: CHROMIUM_ARGS });
+  const browser = await chromium.launch({
+    headless: true,
+    args: CHROMIUM_ARGS,
+  });
+
   logger.info('Chromium を起動しました');
   return browser;
 }
 
 function isBrowserAlive(browser) {
   try {
-    return browser.isConnected();
+    return browser && browser.isConnected();
   } catch (_) {
     return false;
   }
@@ -72,45 +85,25 @@ async function fetchDeliveryStatus(trackingNo, browser) {
 
   try {
     context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       locale: 'ja-JP',
       timezoneId: 'Asia/Tokyo',
     });
 
     page = await context.newPage();
 
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-    await page.waitForTimeout(3000);
+    await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: 30000,
+    });
 
-    let rawText = '';
-    const tableSelectors = [
-      '.tbl-okurijyoSearch',
-      '.wr-okurijyo',
-      '#result',
-      '.resultArea',
-      'table',
-    ];
+    await page.waitForTimeout(5000);
 
-    for (const selector of tableSelectors) {
-      try {
-        const el = await page.$(selector);
-        if (el) {
-          const t = await el.innerText();
-          if (t && t.trim().length > 0) {
-            rawText = t;
-            logger.debug(`セレクタ "${selector}" でテキストを取得`, { preview: rawText.slice(0, 200) });
-            break;
-          }
-        }
-      } catch (_) {}
-    }
+    const rawText = await page.evaluate(() => {
+      return document.body ? document.body.innerText : '';
+    });
 
-    if (!rawText || rawText.trim().length === 0) {
-      rawText = await page.evaluate(() => document.body.innerText);
-      logger.debug('フォールバック: ページ全体テキストを使用');
-    }
-
-    // デバッグ用：取得できている本文をログに出す
     logger.info(`取得ページ本文 ${trackingNo}: ${rawText.substring(0, 3000)}`);
 
     if (
@@ -126,16 +119,21 @@ async function fetchDeliveryStatus(trackingNo, browser) {
     const isReturn = isReturnStatus(status);
 
     logger.info(`ステータス判定完了: ${trackingNo} → ${status}`, { isReturn });
-    return { status, isReturn };
 
+    return { status, isReturn };
   } finally {
     if (page) {
-      try { await page.close(); } catch (e) {
+      try {
+        await page.close();
+      } catch (e) {
         logger.debug(`page.close() エラー（無視）: ${e.message}`);
       }
     }
+
     if (context) {
-      try { await context.close(); } catch (e) {
+      try {
+        await context.close();
+      } catch (e) {
         logger.debug(`context.close() エラー（無視）: ${e.message}`);
       }
     }
@@ -143,7 +141,7 @@ async function fetchDeliveryStatus(trackingNo, browser) {
 }
 
 async function fetchAllStatuses(rows) {
-  if (rows.length === 0) return [];
+  if (!rows || rows.length === 0) return [];
 
   let browser = await launchBrowser();
   const results = [];
@@ -152,20 +150,32 @@ async function fetchAllStatuses(rows) {
     for (const row of rows) {
       if (!isBrowserAlive(browser)) {
         logger.warn('ブラウザがクラッシュしています。再起動します');
-        try { await browser.close(); } catch (_) {}
+        try {
+          await browser.close();
+        } catch (_) {}
         browser = await launchBrowser();
       }
 
       try {
         const result = await fetchDeliveryStatus(row.trackingNo, browser);
-        results.push({ trackingNo: row.trackingNo, ...result });
+        results.push({
+          trackingNo: row.trackingNo,
+          ...result,
+        });
       } catch (err) {
-        logger.error(`伝票 ${row.trackingNo} の処理中にエラー（スキップ）`, { error: err.message });
-        results.push({ trackingNo: row.trackingNo, status: 'エラー', isReturn: false });
+        logger.error(`伝票 ${row.trackingNo} の処理中にエラー（スキップ）`, {
+          error: err.message,
+        });
+
+        results.push({
+          trackingNo: row.trackingNo,
+          status: 'エラー',
+          isReturn: false,
+        });
       }
 
       if (row !== rows[rows.length - 1]) {
-        await new Promise((r) => setTimeout(r, 2000));
+        await new Promise((resolve) => setTimeout(resolve, 2000));
       }
     }
   } finally {
@@ -180,4 +190,8 @@ async function fetchAllStatuses(rows) {
   return results;
 }
 
-module.exports = { fetchAllStatuses, classifyStatus, isReturnStatus };
+module.exports = {
+  fetchAllStatuses,
+  classifyStatus,
+  isReturnStatus,
+};
