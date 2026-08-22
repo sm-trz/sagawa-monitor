@@ -32,9 +32,11 @@ module.exports = {
   PAGE_TIMEOUT_MS: num(process.env.PAGE_TIMEOUT_MS, 30000),
 
   // ── ヤマト運輸 ─────────────────────────────────────────────
-  // 'on' にすると、ヤマトのステータス文言でも返品判定を行う。
-  // 実際のページ内容をログで確認するまでは 'off'（滞留日数だけで判定）。
-  YAMATO_STATUS_JUDGE: (process.env.YAMATO_STATUS_JUDGE || 'off') === 'on',
+  // ヤマトのステータス文言で返品判定を行うか。
+  // 実データ（返品・配達完了）で検証済みのため既定は 'on'。
+  // 誤検知が出た場合は Cloud Run の環境変数で 'off' にすると
+  // 滞留日数だけの判定に戻せる。
+  YAMATO_STATUS_JUDGE: (process.env.YAMATO_STATUS_JUDGE || 'on') === 'on',
 
   // ── 実行の保護 ─────────────────────────────────────────────
   // 値を設定すると /run?token=その値 でないと実行できなくなる（空なら無効）

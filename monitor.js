@@ -119,16 +119,17 @@ async function runMonitor() {
             error: err.message,
             rowIndex: row.rowIndex,
           });
-          result = { status: '取得失敗', detail: err.message, historyCount: 0 };
+          result = { status: '取得失敗', detail: err.message, history: [], historyCount: 0 };
           errorCount++;
         }
 
-        // ヤマトは実データ確認が済むまで、文言による判定を使わない
+        // ヤマトの文言判定を止めたいときは YAMATO_STATUS_JUDGE=off にする
         const trustStatus =
           row.carrierName !== 'ヤマト' || config.YAMATO_STATUS_JUDGE;
 
         const verdict = judge({
           status: result.status,
+          history: result.history || [],
           shipDate: row.shipDate,
           trustStatus,
         });
@@ -141,9 +142,11 @@ async function runMonitor() {
         const alreadyNotified = row.notified === 'TRUE';
         const notified = verdict.flag && !alreadyNotified ? 'TRUE' : row.notified;
 
+        const displayStatus = verdict.effectiveStatus || result.status;
+
         updates.push({
           rowIndex: row.rowIndex,
-          status: result.status,
+          status: displayStatus,
           checkedAt,
           returnFlag: verdict.flag,
           notified,
@@ -156,7 +159,7 @@ async function runMonitor() {
             orderNo: row.orderNo,
             carrier: row.carrierName,
             trackingNo: row.trackingNo,
-            status: result.status,
+            status: displayStatus,
             flag: verdict.flag,
             note: noteParts.join(' / '),
           });

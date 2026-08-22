@@ -164,6 +164,7 @@ function parsePageText(text, trackingNo) {
     return {
       status: '取得失敗',
       detail: 'ページからステータスを読み取れませんでした',
+      history: [],
       historyCount: 0,
       source: 'none',
     };
@@ -181,6 +182,8 @@ function parsePageText(text, trackingNo) {
     status: normalizeStatus(rawStatus),
     rawStatus,
     detail: detailParts.join(' / '),
+    history: history.map((h) => normalizeStatus(h.label)),
+    historyDetail: history,
     historyCount: history.length,
     source,
   };
@@ -213,7 +216,12 @@ async function fetchStatus(browser, trackingNo) {
     }
 
     if (text.includes('JavaScript対応ブラウザ')) {
-      return { status: '取得失敗', detail: 'JavaScript が実行されていません', historyCount: 0 };
+      return {
+        status: '取得失敗',
+        detail: 'JavaScript が実行されていません',
+        history: [],
+        historyCount: 0,
+      };
     }
 
     const parsed = parsePageText(text, trackingNo);

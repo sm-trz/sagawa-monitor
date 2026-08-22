@@ -55,33 +55,45 @@ function daysSinceShip(shipDateValue, now = new Date()) {
 
 /**
  * @param {object} args
- * @param {string} args.status       正規化済みステータス
+ * @param {string} args.status       正規化済みの最新ステータス
+ * @param {string[]} args.history    履歴に出てきたステータスの一覧（古い順）
  * @param {string} args.shipDate     発送日（シートの文字列）
  * @param {boolean} args.trustStatus ステータス文言を判定に使ってよいか
  * @param {Date}   args.now
  */
-function judge({ status, shipDate, trustStatus = true, now = new Date() }) {
+function judge({ status, history = [], shipDate, trustStatus = true, now = new Date() }) {
   const elapsed = daysSinceShip(shipDate, now);
   const notes = [];
+  let effectiveStatus = status;
 
-  // ① 配達完了 → 監視終了。滞留していても関係なし。
+  // ① 配達完了 → 監視終了。履歴に持戻りなどがあっても関係なし。
+  //    （不在→再配達→完了 は正常な流れなので誤検知してはいけない）
   if (FINISHED_STATUSES.has(status)) {
-    return { flag: FLAG_NONE, finished: true, elapsed, notes: [] };
+    return { flag: FLAG_NONE, finished: true, elapsed, notes: [], effectiveStatus };
   }
 
   let flag = FLAG_NONE;
 
-  // ② 文言による判定
+  // ② 履歴の中に明確な返品・返送があれば、それを最新扱いにする。
+  //    実例: ヤマトで「返品」の後に「陸・海上切替え」が記録されていた。
+  //    最後の1行だけ見ると返品を見逃すため、履歴全体を確認する。
+  const strongInHistory = history.find((h) => RETURN_STRONG.has(h));
+
+  // ③ 文言による判定
   if (trustStatus) {
     if (RETURN_STRONG.has(status)) {
       flag = FLAG_STRONG;
       notes.push(`ステータス「${status}」を検知`);
+    } else if (strongInHistory) {
+      flag = FLAG_STRONG;
+      effectiveStatus = strongInHistory;
+      notes.push(`履歴に「${strongInHistory}」あり（最新の記録は「${status}」）`);
     } else if (RETURN_WATCH.has(status)) {
       flag = FLAG_WATCH;
       notes.push(`ステータス「${status}」を検知`);
     }
-  } else if (RETURN_STRONG.has(status) || RETURN_WATCH.has(status)) {
-    notes.push(`ステータス「${status}」（判定は保留中）`);
+  } else if (RETURN_STRONG.has(status) || RETURN_WATCH.has(status) || strongInHistory) {
+    notes.push(`ステータス「${strongInHistory || status}」（判定は保留中）`);
   }
 
   // ③ 滞留検知（文言に依存しない安全網）
@@ -109,7 +121,7 @@ function judge({ status, shipDate, trustStatus = true, now = new Date() }) {
     notes.push(`未知のステータス「${status}」`);
   }
 
-  return { flag, finished: false, elapsed, notes };
+  return { flag, finished: false, elapsed, notes, effectiveStatus };
 }
 
 /** 監視自体をやめる期限を過ぎているか */
