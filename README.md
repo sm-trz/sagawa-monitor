@@ -1,343 +1,98 @@
 # sagawa-monitor
 
-佐川急便の配送状況を定期監視し、Google スプレッドシートへ自動反映するシステム。
+佐川急便・ヤマト運輸の配送状況を定期的に確認し、返品候補を Google スプレッドシートへ記録するシステム。
 
-Cloud Run + Playwright + Google Sheets API で構成されており、Cloud Scheduler から定期実行することを想定しています。
-
----
-
-## アーキテクチャ
+## 全体の流れ
 
 ```
-Cloud Scheduler
-    │  (HTTP POST /run)
-    ▼
-Cloud Run (sagawa-monitor)
-    │
-    ├── Google Sheets API  ←→  スプレッドシート「返品管理」
-    │       読み取り: B列（伝票番号）
-    │       書き込み: D列（ステータス）/ E列（確認日時）/ F列（返品候補）/ G列（通知済）
-    │
-    └── Playwright (Chromium headless)
-            └── 佐川急便 荷物問い合わせページ
+Cloud Scheduler（1日2〜3回）
+  ↓ POST /run
+Cloud Run（Node.js + Playwright + Chromium）
+  ↓ 読み取り
+Google スプレッドシート「返品管理」
+  ↓ 未完了の伝票だけ照会
+佐川急便 / ヤマト運輸 の荷物問い合わせページ
+  ↓ 判定
+Google スプレッドシートへ書き戻し（E〜I列）
 ```
 
----
-
-## ディレクトリ構成
-
-```
-sagawa-monitor/
-├── src/
-│   ├── index.js      # エントリーポイント（HTTP サーバー）
-│   ├── monitor.js    # 監視処理のメインロジック
-│   ├── sagawa.js     # Playwright スクレイピング
-│   ├── sheets.js     # Google Sheets API クライアント
-│   ├── logger.js     # Winston ロガー設定
-│   └── test.js       # ローカル動作確認スクリプト
-├── Dockerfile        # Cloud Run 向けコンテナ定義
-├── cloudbuild.yaml   # Cloud Build デプロイ設定
-├── package.json
-├── .env.example      # 環境変数サンプル
-├── .gitignore
-└── README.md
-```
-
----
-
-## スプレッドシートの構成
-
-シート名: **返品管理**
-
-| 列 | 内容 | 説明 |
-|---|---|---|
-| A | 注文番号 | 社内管理番号 |
-| B | 伝票番号 | 佐川急便の10桁または12桁の伝票番号 |
-| C | 発送日 | 出荷日 |
-| D | 最終ステータス | ← 本システムが自動更新 |
-| E | 最終確認日時 | ← 本システムが自動更新 |
-| F | 返品候補 | ← 返品系ステータスのとき TRUE を設定 |
-| G | 通知済 | ← 返品候補として通知済みのとき TRUE を設定 |
-
-### 判定するステータス
-
-| ステータス | 返品フラグ |
-|---|---|
-| 配達完了 | - |
-| 配達中 | - |
-| 輸送中 | - |
-| 集荷 | - |
-| 保管中 | - |
-| 持戻り | ✅ TRUE |
-| 受取拒否 | ✅ TRUE |
-| 受取辞退 | ✅ TRUE |
-| 返送 | ✅ TRUE |
-| 返品 | ✅ TRUE |
-| 長期不在 | ✅ TRUE |
-| 伝票不明 | - |
-| エラー | - |
-
----
-
-## セットアップ手順
-
-### 1. Google Cloud プロジェクトの準備
-
-```bash
-# プロジェクト ID を設定
-export PROJECT_ID=your-gcp-project-id
-gcloud config set project $PROJECT_ID
-
-# 必要な API を有効化
-gcloud services enable \
-  run.googleapis.com \
-  cloudbuild.googleapis.com \
-  sheets.googleapis.com \
-  secretmanager.googleapis.com
-```
-
-### 2. サービスアカウントの作成
-
-```bash
-# Cloud Run 用サービスアカウント
-gcloud iam service-accounts create sagawa-monitor-sa \
-  --display-name="Sagawa Monitor Service Account"
-
-export SA_EMAIL=sagawa-monitor-sa@${PROJECT_ID}.iam.gserviceaccount.com
-
-# Google Sheets へのアクセス権限
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/editor"
-```
-
-### 3. スプレッドシートの共有設定
-
-1. Google スプレッドシートを開く
-2. 右上の「共有」をクリック
-3. 上記で作成したサービスアカウントのメールアドレスを「編集者」として追加
-   ```
-   sagawa-monitor-sa@YOUR_PROJECT_ID.iam.gserviceaccount.com
-   ```
-
-### 4. Secret Manager への環境変数登録
-
-```bash
-# スプレッドシート ID を Secret Manager へ登録
-echo -n "your_spreadsheet_id" | \
-  gcloud secrets create SPREADSHEET_ID \
-    --data-file=- \
-    --replication-policy=automatic
-
-# サービスアカウントに Secret へのアクセス権を付与
-gcloud secrets add-iam-policy-binding SPREADSHEET_ID \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/secretmanager.secretAccessor"
-```
-
-### 5. GitHub リポジトリへ Push
-
-```bash
-# リモートリポジトリが設定済みの場合
-git add .
-git commit -m "feat: 佐川急便配送状況監視システム 初期実装"
-git push origin main
-```
-
-### 6. Cloud Build トリガーの設定
-
-Cloud Console または gcloud コマンドでトリガーを作成します。
-
-```bash
-gcloud builds triggers create github \
-  --repo-name=sagawa-monitor \
-  --repo-owner=YOUR_GITHUB_USERNAME \
-  --branch-pattern="^main$" \
-  --build-config=cloudbuild.yaml \
-  --name="sagawa-monitor-deploy"
-```
-
-### 7. Cloud Run への初回デプロイ
-
-```bash
-# 手動デプロイ（Cloud Build を使用）
-gcloud builds submit --config cloudbuild.yaml \
-  --substitutions="_SERVICE_NAME=sagawa-monitor,_REGION=asia-northeast1"
-```
-
-### 8. Cloud Run に環境変数を設定
-
-```bash
-gcloud run services update sagawa-monitor \
-  --region=asia-northeast1 \
-  --service-account=$SA_EMAIL \
-  --set-secrets="SPREADSHEET_ID=SPREADSHEET_ID:latest" \
-  --set-env-vars="SHEET_NAME=返品管理,NODE_ENV=production"
-```
-
-### 9. Cloud Scheduler の設定
-
-```bash
-# Cloud Run の URL を取得
-export RUN_URL=$(gcloud run services describe sagawa-monitor \
-  --region=asia-northeast1 \
-  --format='value(status.url)')
-
-# Scheduler 用サービスアカウントの作成
-gcloud iam service-accounts create sagawa-scheduler-sa \
-  --display-name="Sagawa Scheduler SA"
-
-export SCHEDULER_SA=sagawa-scheduler-sa@${PROJECT_ID}.iam.gserviceaccount.com
-
-# Cloud Run 呼び出し権限を付与
-gcloud run services add-iam-policy-binding sagawa-monitor \
-  --region=asia-northeast1 \
-  --member="serviceAccount:${SCHEDULER_SA}" \
-  --role="roles/run.invoker"
-
-# スケジュールジョブ作成（毎日 9:00, 13:00, 17:00 JST に実行）
-gcloud scheduler jobs create http sagawa-monitor-job \
-  --location=asia-northeast1 \
-  --schedule="0 9,13,17 * * *" \
-  --time-zone="Asia/Tokyo" \
-  --uri="${RUN_URL}/" \
-  --http-method=GET \
-  --oidc-service-account-email=$SCHEDULER_SA \
-  --oidc-token-audience=$RUN_URL
-```
-
----
-
-## ローカル開発
-
-### 環境構築
-
-```bash
-# 依存パッケージのインストール
-npm install
-
-# Playwright の Chromium をインストール
-npx playwright install chromium
-
-# 環境変数の設定
-cp .env.example .env
-# .env を編集して SPREADSHEET_ID 等を設定
-```
-
-### ローカル実行
-
-```bash
-# サーバー起動
-npm start
-
-# 起動直後に監視処理を実行する場合
-RUN_ON_STARTUP=true npm start
-```
-
-### 動作テスト
-
-```bash
-# ステータス判定ロジックの単体テスト
-npm test
-
-# 特定の伝票番号でスクレイピングテスト
-node src/test.js --tracking 1234567890
-
-# HTTP エンドポイントの手動テスト
-curl http://localhost:8080/health
-curl -X POST http://localhost:8080/run
-```
-
-### Docker でローカルテスト
-
-```bash
-# イメージをビルド
-docker build -t sagawa-monitor .
-
-# コンテナを起動（.env の内容を渡す）
-docker run --rm \
-  --env-file .env \
-  -p 8080:8080 \
-  sagawa-monitor
-
-# 動作確認
-curl http://localhost:8080/health
-curl http://localhost:8080/
-```
-
----
-
-## API エンドポイント
-
-| メソッド | パス | 説明 |
-|---|---|---|
-| GET | `/health` | ヘルスチェック（Cloud Run の起動確認用） |
-| GET | `/` | 監視処理を非同期で実行（Cloud Scheduler 用） |
-| POST | `/run` | 監視処理を非同期で実行（手動トリガー用） |
-
----
-
-## 環境変数一覧
-
-| 変数名 | 必須 | デフォルト | 説明 |
-|---|---|---|---|
-| `SPREADSHEET_ID` | ✅ | - | Google スプレッドシートの ID |
-| `SHEET_NAME` | - | `返品管理` | 対象シート名 |
-| `PORT` | - | `8080` | HTTP サーバーのポート番号 |
-| `RUN_ON_STARTUP` | - | `false` | 起動直後に監視処理を実行するか |
-| `LOG_LEVEL` | - | `info` | ログレベル（debug/info/warn/error） |
-| `GOOGLE_APPLICATION_CREDENTIALS` | ローカルのみ | - | サービスアカウントキー JSON のパス |
-
----
-
-## トラブルシューティング
-
-### Playwright が起動しない
-
-Cloud Run のメモリが不足している可能性があります。`cloudbuild.yaml` の `--memory` を `2Gi` 以上に増やしてください。
-
-```bash
-gcloud run services update sagawa-monitor \
-  --region=asia-northeast1 \
-  --memory=2Gi
-```
-
-### Google Sheets API の認証エラー
-
-サービスアカウントにスプレッドシートの編集権限が付与されているか確認してください。
-
-```bash
-# Cloud Run のサービスアカウントを確認
-gcloud run services describe sagawa-monitor \
-  --region=asia-northeast1 \
-  --format='value(spec.template.spec.serviceAccountName)'
-```
-
-### ステータスが「不明」になる
-
-佐川急便のページ構造が変わった可能性があります。`src/sagawa.js` の `tableSelectors` と `STATUS_KEYWORDS` を確認・更新してください。
-
-ローカルでデバッグする際は `headless: false` に変更すると画面を確認できます。
-
-### Cloud Scheduler から呼び出せない
-
-Cloud Run が `--no-allow-unauthenticated` で保護されているため、Scheduler のサービスアカウントに `roles/run.invoker` 権限が必要です。セットアップ手順 9 を確認してください。
-
----
-
-## コスト見積もり
-
-月 90 回実行（1 日 3 回 × 30 日）、1 回あたり 5 分の場合：
-
-| リソース | 試算 |
-|---|---|
-| Cloud Run（2 vCPU / 2GB / 5分 × 90回） | 約 $1〜2 |
-| Cloud Build（1800秒 × ビルド回数） | 約 $0〜1 |
-| Cloud Scheduler | 無料枠内 |
-| **合計** | **約 $1〜3/月** |
-
----
-
-## ライセンス
-
-MIT
+## スプレッドシートの列
+
+| 列 | 内容 | 入力者 |
+|----|------|--------|
+| A | 注文番号 | 人 |
+| B | 配送会社（`佐川` または `ヤマト`） | 人 |
+| C | 伝票番号 | 人 |
+| D | 発送日 | 人 |
+| E | 最終ステータス | システム |
+| F | 最終確認日時 | システム |
+| G | 返品候補（空 / `要確認` / `返品濃厚`） | システム |
+| H | 通知済（`TRUE`） | システム |
+| I | 備考 | システム |
+
+## ファイルの役割
+
+| ファイル | 役割 |
+|----------|------|
+| `index.js` | Cloud Run の入口（HTTP サーバー） |
+| `monitor.js` | 処理全体の流れ |
+| `judge.js` | 返品候補かどうかの判定ルール |
+| `sheets.js` | スプレッドシートの読み書き |
+| `browser.js` | Chromium の起動・終了 |
+| `config.js` | 設定（環境変数） |
+| `logger.js` | ログ出力 |
+| `carriers/sagawa.js` | 佐川急便のページ解析 |
+| `carriers/yamato.js` | ヤマト運輸のページ解析 |
+| `carriers/index.js` | 配送会社の振り分け |
+| `test.js` | 通信なしの判定テスト（`npm test`） |
+
+## URL
+
+| URL | 動作 |
+|-----|------|
+| `GET /` | 設定内容を表示するだけ。**監視は実行されない** |
+| `GET /run` | 監視を実行（ブラウザからのテスト用） |
+| `POST /run` | 監視を実行（Cloud Scheduler 用） |
+| `GET /health` | 生存確認 |
+
+## 環境変数
+
+| 名前 | 既定値 | 意味 |
+|------|--------|------|
+| `SPREADSHEET_ID` | （必須） | スプレッドシートの ID |
+| `SHEET_NAME` | `返品管理` | シート名 |
+| `STALE_DAYS` | `7` | 発送から何日で「要確認」にするか |
+| `MAX_MONITOR_DAYS` | `45` | 何日で監視を打ち切るか |
+| `REQUEST_INTERVAL_MS` | `3000` | 1件ごとの待ち時間 |
+| `MAX_PER_RUN` | `150` | 1回の実行で照会する上限 |
+| `YAMATO_STATUS_JUDGE` | `off` | ヤマトの文言で返品判定するか |
+| `DUMP_PAGE_TEXT` | `on` | ページ本文をログに出すか |
+| `RUN_TOKEN` | （空） | 設定すると `/run?token=` が必要になる |
+| `LOG_LEVEL` | `info` | ログの詳しさ |
+
+## 判定ルール
+
+1. **配達完了** → 監視終了。以後照会しない
+2. **返送 / 返品 / 受取拒否 / 受取辞退** → `返品濃厚`
+3. **調査中 / 持戻り / 長期不在** → `要確認`
+4. **発送から `STALE_DAYS` 日を超えて未完了** → `要確認`（文言に依存しない安全網）
+5. 想定外の文言 → `要確認`（気づけるようにするため）
+
+### 佐川ページ解析の要点（実データで確認済み）
+
+- 履歴の最新の1行だけ `⇒` が付く。**必ずこの行を見る**
+- ページ全文のキーワード検索は禁止。`集荷に関するお問い合せ` という共通ラベルで誤ヒットする
+- **返品された荷物に「返品」とは表示されない**。実例では `調査中` + 履歴テーブル消失だった
+
+## デプロイ
+
+GitHub の main ブランチへの push → Cloud Build（GitHub 継続デプロイ）→ Cloud Run。
+`cloudbuild.yaml` は使用していません。Cloud Run の設定は Google Cloud コンソール側で管理します。
+
+## 将来の移行先
+
+公開ページの巡回ではなく、公式 API への移行を推奨します。
+`carriers/` の中身を差し替えるだけで移行できる構造にしてあります。
+
+- 佐川急便 スマートAPI: https://www.sagawa-exp.co.jp/business/send/service/option/smart-api/
+- ヤマト運輸 クロネコメンバーズサービス連携API: https://business.kuronekoyamato.co.jp/service/lineup/business_members/api/km/

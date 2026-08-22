@@ -1,55 +1,105 @@
 /**
- * sagawa-monitor / src/index.js
- * Cloud Run エントリーポイント
+ * index.js
+ * Cloud Run のエントリーポイント。
  *
- * Cloud Run はレスポンス返却後に CPU を停止するため、
- * すべての処理を HTTP リクエストのスコープ内（await）で完結させる。
- * setImmediate / バックグラウンド実行は使用しない。
+ *   GET  /        → 何もしない。設定内容を表示するだけ（安全のため）
+ *   GET  /run     → 監視を実行（ブラウザからのテスト用）
+ *   POST /run     → 監視を実行（Cloud Scheduler 用）
+ *   GET  /health  → 生存確認
+ *
+ * 監視処理はレスポンスを返す前に await して完了させます。
+ * Cloud Run はレスポンス送信後に CPU を止めるため、
+ * バックグラウンド実行にすると処理が途中で凍結するからです。
  */
 
 require('dotenv').config();
+
 const http = require('http');
 const { runMonitor } = require('./monitor');
 const logger = require('./logger');
+const config = require('./config');
 
 const PORT = process.env.PORT || 8080;
 
-// ── HTTP サーバー（Cloud Run はポートを Listen する必要がある） ──────────────
+// 同時に2つ走らないようにする（配送会社サイトへの二重アクセス防止）
+let running = false;
+
+function sendJson(res, code, body) {
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(body, null, 2));
+}
+
 const server = http.createServer(async (req, res) => {
-  // ヘルスチェック: 即時応答
-  if (req.method === 'GET' && req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
-    return;
+  let path = '/';
+  let token = null;
+  try {
+    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    path = url.pathname;
+    token = url.searchParams.get('token');
+  } catch (_) {
+    return sendJson(res, 400, { status: 'error', message: 'リクエストを解釈できません' });
   }
 
-  // GET / または POST /run → 監視処理をリクエスト内で完結させてからレスポンスを返す
-  if (
-    (req.method === 'GET'  && req.url === '/') ||
-    (req.method === 'POST' && req.url === '/run')
-  ) {
+  if (path === '/health') {
+    return sendJson(res, 200, { status: 'ok', time: new Date().toISOString() });
+  }
+
+  // トップページでは実行しない。Bot や favicon のアクセスで
+  // 勝手に監視が走るのを防ぐためです。
+  if (path === '/') {
+    return sendJson(res, 200, {
+      service: 'sagawa-monitor',
+      message: 'このURLでは監視は実行されません。実行するには末尾に /run を付けてください。',
+      endpoints: {
+        run: 'GET /run （ブラウザ用） / POST /run （Cloud Scheduler 用）',
+        health: 'GET /health',
+      },
+      settings: {
+        'シート名': config.SHEET_NAME,
+        '滞留とみなす日数': config.STALE_DAYS,
+        '監視を打ち切る日数': config.MAX_MONITOR_DAYS,
+        '1回の最大照会件数': config.MAX_PER_RUN,
+        '照会間隔ミリ秒': config.REQUEST_INTERVAL_MS,
+        'ヤマトの文言判定': config.YAMATO_STATUS_JUDGE ? 'on' : 'off（滞留検知のみ）',
+        'ページ本文のログ出力': config.DUMP_PAGE_TEXT ? 'on' : 'off',
+      },
+      running,
+    });
+  }
+
+  if (path === '/run') {
+    if (config.RUN_TOKEN && token !== config.RUN_TOKEN) {
+      return sendJson(res, 403, { status: 'forbidden', message: 'token が正しくありません' });
+    }
+    if (running) {
+      return sendJson(res, 409, {
+        status: 'busy',
+        message: '前回の監視処理がまだ実行中です。終わるまでお待ちください。',
+      });
+    }
+
+    running = true;
     try {
       const result = await runMonitor();
-      logger.info('監視処理が正常に完了しました');
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'ok', result }));
+      return sendJson(res, 200, { status: 'ok', result });
     } catch (err) {
-      logger.error('監視処理でエラーが発生しました', { error: err.message, stack: err.stack });
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ status: 'error', message: err.message }));
+      logger.error('監視処理でエラーが発生しました', {
+        error: err.message,
+        stack: err.stack,
+      });
+      return sendJson(res, 500, { status: 'error', message: err.message });
+    } finally {
+      running = false;
     }
-    return;
   }
 
-  res.writeHead(404, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'Not Found' }));
+  return sendJson(res, 404, { status: 'error', message: 'ページが見つかりません' });
 });
 
 server.listen(PORT, () => {
-  logger.info(`サーバー起動: port=${PORT}`);
+  logger.info(`サーバーを起動しました: port=${PORT}`);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   logger.info('SIGTERM を受信しました。サーバーを停止します');
   server.close(() => process.exit(0));

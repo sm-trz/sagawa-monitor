@@ -1,108 +1,129 @@
 /**
- * sagawa-monitor / src/test.js
- * ローカル動作確認スクリプト
+ * test.js
+ * 通信をせずに判定ロジックだけを確認するテスト。
  *
- * 使い方:
- *   SPREADSHEET_ID=xxx node src/test.js
- *   または
- *   node src/test.js --tracking 1234567890
+ * 使い方（ローカル / Cloud Shell）:
+ *   node test.js
+ *
+ * ここで使っているページ本文は、2026-08-20 に Cloud Run のログから
+ * 実際に取得した本物のデータです。
  */
 
-require('dotenv').config();
-const { classifyStatus, isReturnStatus } = require('./sagawa');
-const logger = require('./logger');
+const { parsePageText, normalizeStatus } = require('./carriers/sagawa');
+const { judge, daysSinceShip } = require('./judge');
 
-// ── ステータス判定ロジックの単体テスト ──────────────────────────────────────
-function runStatusTests() {
-  console.log('\n=== ステータス判定テスト ===\n');
+// ── 実データ①: 輸送中 ────────────────────────────────────────
+const PAGE_TRANSIT = [
+  '佐川急便', '', 'お荷物問い合わせサービス', '国際貨物の検索はこちら',
+  'ご利用方法 よくある質問 English お問い合せ送り状No.入力画面へ', '',
+  '詳細\tお問い合せ送り状No.\t最新荷物状況', '詳細1', '\t444803015366\t',
+  '輸送中', '', 'ただいま配達営業所へ輸送中です。', '',
+  '配達予定日　　：', '08月21日　18～21時',
+  'お問い合せ送り状No.\t444803015366', '出荷日\t2026年08月20日',
+  '集荷に関するお問い合せ\t西埼玉営業所  TEL:0570-55-0421 FAX:04-2953-9470',
+  '配達に関するお問い合せ\t城北営業所  TEL:0570-01-0362 FAX:03-5945-5650',
+  'お荷物個数\t1個',
+  '荷物状況\t日時\t担当営業所',
+  '↓集荷\t08/20 17:13\t西埼玉営業所',
+  '⇒輸送中\t08/20 23:09\t関東中継センター',
+  'スマートクラブログイン',
+].join('\n');
 
-  const testCases = [
-    { input: 'お荷物は配達完了となりました', expected: '配達完了' },
-    { input: 'ただいま配達中です', expected: '配達中' },
-    { input: '幹線輸送中', expected: '輸送中' },
-    { input: '配達店到着', expected: '輸送中' },
-    { input: '集荷完了しました', expected: '集荷' },
-    { input: '営業所保管中', expected: '保管中' },
-    { input: '不在持戻しました', expected: '持戻り' },
-    { input: '長期不在のため保管', expected: '長期不在' },
-    { input: '受取拒否されました', expected: '受取拒否' },
-    { input: '受取辞退', expected: '受取辞退' },
-    { input: '返送処理中', expected: '返送' },
-    { input: '返品完了', expected: '返品' },
-    { input: 'その他の文字列', expected: '不明' },
-    { input: '', expected: '不明' },
-  ];
+// ── 実データ②: 途中で「保管中」を経由したが最終は配達完了 ──
+const PAGE_DELIVERED_AFTER_HOLD = [
+  '佐川急便', '', 'お荷物問い合わせサービス', '',
+  '詳細\tお問い合せ送り状No.\t最新荷物状況', '詳細1', '\t444803009836\t',
+  '配達完了', '', 'お荷物のお届けが完了いたしました。',
+  'ご利用いただきありがとうございました。', '',
+  '配達完了日　　：', '08月19日　18時23分',
+  'お問い合せ送り状No.\t444803009836', '出荷日\t2026年08月17日',
+  '集荷に関するお問い合せ\t西埼玉営業所  TEL:0570-55-0421 FAX:04-2953-9470',
+  'お荷物個数\t1個',
+  '荷物状況\t日時\t担当営業所',
+  '↓集荷\t08/17 17:22\t西埼玉営業所',
+  '↓輸送中\t08/17 18:10\t北関東中継センター',
+  '↓輸送中\t08/18 05:50\t関西中継センター',
+  '↓保管中\t08/18 14:14\t松江営業所',
+  '↓配達中\t08/19 13:19\t松江営業所',
+  '⇒配達完了\t08/19 18:23\t松江営業所',
+  'スマートクラブログイン',
+].join('\n');
 
-  let passed = 0;
-  let failed = 0;
+// ── 実データ③: 返品確定の荷物（履歴テーブルが消えている）──
+const PAGE_RETURNED = [
+  '佐川急便', '', 'お荷物問い合わせサービス', '',
+  '詳細\tお問い合せ送り状No.\t最新荷物状況', '詳細1', '\t444803002033\t',
+  '調査中', '', '恐れ入りますが、営業所へお問い合わせください。', '',
+  'お問い合せ送り状No.\t444803002033', '出荷日\t2026年08月07日',
+  '集荷に関するお問い合せ\t西埼玉営業所  TEL:0570-55-0421 FAX:04-2953-9470',
+  '配達に関するお問い合せ\t荒川営業所  TEL:0570-01-0659 FAX:03-3616-8851',
+  'お荷物個数\t1個',
+  '詳細表示\t恐れ入りますが、営業所へお問い合わせください。',
+  '関連リンク', '\tスマートクラブログイン',
+].join('\n');
 
-  for (const { input, expected } of testCases) {
-    const result = classifyStatus(input);
-    const ok = result === expected;
-    const icon = ok ? '✅' : '❌';
-    console.log(`${icon} "${input}" → ${result} (期待値: ${expected})`);
-    if (ok) passed++; else failed++;
-  }
+let passed = 0;
+let failed = 0;
 
-  console.log(`\n結果: ${passed} 件合格 / ${failed} 件失敗\n`);
+function check(title, actual, expected) {
+  const ok = actual === expected;
+  console.log(`${ok ? '  OK ' : '  NG '} ${title}: ${actual}${ok ? '' : `（期待値: ${expected}）`}`);
+  ok ? passed++ : failed++;
 }
 
-// ── 返品判定テスト ────────────────────────────────────────────────────────────
-function runReturnFlagTests() {
-  console.log('=== 返品フラグテスト ===\n');
+console.log('\n=== 佐川ページの解析テスト（実データ） ===\n');
 
-  const cases = [
-    { status: '受取拒否', expected: true },
-    { status: '受取辞退', expected: true },
-    { status: '返送',     expected: true },
-    { status: '返品',     expected: true },
-    { status: '長期不在', expected: true },
-    { status: '持戻り',   expected: true },
-    { status: '配達完了', expected: false },
-    { status: '輸送中',   expected: false },
-    { status: '不明',     expected: false },
-  ];
+const t1 = parsePageText(PAGE_TRANSIT, '444803015366');
+check('444803015366 のステータス', t1.status, '輸送中');
 
-  let passed = 0;
-  let failed = 0;
+const t2 = parsePageText(PAGE_DELIVERED_AFTER_HOLD, '444803009836');
+check('444803009836 のステータス（履歴に保管中あり）', t2.status, '配達完了');
 
-  for (const { status, expected } of cases) {
-    const result = isReturnStatus(status);
-    const ok = result === expected;
-    const icon = ok ? '✅' : '❌';
-    console.log(`${icon} "${status}" → isReturn=${result} (期待値: ${expected})`);
-    if (ok) passed++; else failed++;
-  }
+const t3 = parsePageText(PAGE_RETURNED, '444803002033');
+check('444803002033 のステータス（返品確定・履歴なし）', t3.status, '調査中');
+check('444803002033 は履歴が0件', String(t3.historyCount), '0');
 
-  console.log(`\n結果: ${passed} 件合格 / ${failed} 件失敗\n`);
-}
+console.log('\n=== 返品候補の判定テスト ===\n');
 
-// ── 実際のスクレイピングテスト（引数に --tracking を渡した場合） ──────────────
-async function runScrapingTest() {
-  const args = process.argv.slice(2);
-  const trackingIdx = args.indexOf('--tracking');
-  if (trackingIdx === -1) return;
+// 「今日」を固定してテストする
+const TODAY = new Date(2026, 7, 21); // 2026-08-21
 
-  const trackingNo = args[trackingIdx + 1];
-  if (!trackingNo) {
-    console.error('--tracking の後に伝票番号を指定してください');
-    return;
-  }
+const v1 = judge({ status: '輸送中', shipDate: '2026/08/20', now: TODAY });
+check('輸送中・発送1日 → フラグなし', v1.flag || '(なし)', '(なし)');
 
-  console.log(`\n=== スクレイピングテスト: ${trackingNo} ===\n`);
+const v2 = judge({ status: '配達完了', shipDate: '2026/08/17', now: TODAY });
+check('配達完了 → 監視終了', String(v2.finished), 'true');
 
-  const { fetchAllStatuses } = require('./sagawa');
-  try {
-    const results = await fetchAllStatuses([{ trackingNo }]);
-    console.log('取得結果:', JSON.stringify(results, null, 2));
-  } catch (err) {
-    console.error('エラー:', err.message);
-  }
-}
+const v3 = judge({ status: '調査中', shipDate: '2026/08/07', now: TODAY });
+check('調査中・発送14日 → 要確認', v3.flag, '要確認');
 
-// ── 実行 ─────────────────────────────────────────────────────────────────────
-(async () => {
-  runStatusTests();
-  runReturnFlagTests();
-  await runScrapingTest();
-})();
+const v4 = judge({ status: '輸送中', shipDate: '2026/08/01', now: TODAY });
+check('輸送中だが発送20日経過 → 要確認（滞留検知）', v4.flag, '要確認');
+
+const v5 = judge({ status: '受取拒否', shipDate: '2026/08/20', now: TODAY });
+check('受取拒否 → 返品濃厚', v5.flag, '返品濃厚');
+
+const v6 = judge({ status: '持戻り', shipDate: '2026/08/20', now: TODAY });
+check('持戻り・発送1日 → 要確認', v6.flag, '要確認');
+
+const v7 = judge({ status: '持戻り', shipDate: '2026/08/20', trustStatus: false, now: TODAY });
+check('ヤマト判定オフ時の持戻り → フラグなし', v7.flag || '(なし)', '(なし)');
+
+const v8 = judge({ status: '配達完了', shipDate: '2026/07/01', now: TODAY });
+check('配達完了なら滞留でもフラグなし', v8.flag || '(なし)', '(なし)');
+
+console.log('\n=== 表記ゆれの変換テスト ===\n');
+check('差出人へ返送', normalizeStatus('差出人へ返送'), '返送');
+check('不在持戻', normalizeStatus('不在持戻'), '持戻り');
+check('長期間不在', normalizeStatus('長期間不在'), '長期不在');
+
+console.log('\n=== 経過日数の計算テスト ===\n');
+check('2026/08/07 からの経過日数', String(daysSinceShip('2026/08/07', TODAY)), '14');
+check('2026年8月7日 という書き方', String(daysSinceShip('2026年8月7日', TODAY)), '14');
+check('空欄なら null', String(daysSinceShip('', TODAY)), 'null');
+
+console.log(`\n----------------------------------------`);
+console.log(`  合格 ${passed} 件 / 不合格 ${failed} 件`);
+console.log(`----------------------------------------\n`);
+
+process.exit(failed === 0 ? 0 : 1);
