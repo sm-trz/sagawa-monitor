@@ -96,86 +96,128 @@ async function runMonitor() {
   let successCount = 0;
   let errorCount = 0;
 
-  // ── 2. 配送会社サイトを順番に照会 ────────────────────────
+  // ── 2. 配送会社サイトを照会 ──────────────────────────────
+  // 配送会社ごとにまとめる。ヤマトは1回の検索で最大10件を照会できるため、
+  // まとめられる会社はまとめて取得してアクセス回数と時間を減らす。
+  const resultsByRow = new Map();
+
   if (limited.length > 0) {
+    const groups = new Map();
+    for (const row of limited) {
+      if (!groups.has(row.carrierName)) groups.set(row.carrierName, []);
+      groups.get(row.carrierName).push(row);
+    }
+
     let browser = await launchBrowser();
     try {
-      for (let i = 0; i < limited.length; i++) {
-        const row = limited[i];
+      for (const [carrierName, carrierRows] of groups) {
+        const carrier = getCarrier(carrierName);
+        const canBatch = carrier.BATCH_SIZE > 1 && typeof carrier.fetchStatusBatch === 'function';
+        const chunkSize = canBatch ? carrier.BATCH_SIZE : 1;
 
-        if (!isAlive(browser)) {
-          logger.warn('Chromium が落ちていたため再起動します');
-          try { await closeBrowser(browser); } catch (_) { /* 無視 */ }
-          browser = await launchBrowser();
-        }
-
-        const carrier = getCarrier(row.carrierName);
-        let result;
-        try {
-          result = await carrier.fetchStatus(browser, row.trackingNo);
-          successCount++;
-        } catch (err) {
-          logger.error(`[${row.carrierName}] ${row.trackingNo} の取得に失敗`, {
-            error: err.message,
-            rowIndex: row.rowIndex,
-          });
-          result = { status: '取得失敗', detail: err.message, history: [], historyCount: 0 };
-          errorCount++;
-        }
-
-        // ヤマトの文言判定を止めたいときは YAMATO_STATUS_JUDGE=off にする
-        const trustStatus =
-          row.carrierName !== 'ヤマト' || config.YAMATO_STATUS_JUDGE;
-
-        const verdict = judge({
-          status: result.status,
-          history: result.history || [],
-          shipDate: row.shipDate,
-          trustStatus,
+        logger.info(`[${carrierName}] ${carrierRows.length} 件を照会します`, {
+          まとめ照会: canBatch ? `${chunkSize}件ずつ` : 'なし（1件ずつ）',
         });
 
-        const noteParts = [];
-        if (result.detail) noteParts.push(result.detail);
-        if (verdict.notes.length) noteParts.push(...verdict.notes);
+        for (let i = 0; i < carrierRows.length; i += chunkSize) {
+          const chunk = carrierRows.slice(i, i + chunkSize);
 
-        // 一度立った通知済フラグは消さない（同じ荷物で何度も通知しないため）
-        const alreadyNotified = row.notified === 'TRUE';
-        const notified = verdict.flag && !alreadyNotified ? 'TRUE' : row.notified;
+          if (!isAlive(browser)) {
+            logger.warn('Chromium が落ちていたため再起動します');
+            try { await closeBrowser(browser); } catch (_) { /* 無視 */ }
+            browser = await launchBrowser();
+          }
 
-        const displayStatus = verdict.effectiveStatus || result.status;
+          let map;
+          try {
+            if (canBatch) {
+              map = await carrier.fetchStatusBatch(browser, chunk.map((r) => r.trackingNo));
+            } else {
+              const one = await carrier.fetchStatus(browser, chunk[0].trackingNo);
+              map = new Map([[chunk[0].trackingNo, one]]);
+            }
+          } catch (err) {
+            logger.error(`[${carrierName}] 照会に失敗しました`, {
+              error: err.message,
+              trackingNos: chunk.map((r) => r.trackingNo),
+            });
+            map = new Map();
+          }
 
-        updates.push({
-          rowIndex: row.rowIndex,
-          status: displayStatus,
-          checkedAt,
-          returnFlag: verdict.flag,
-          notified,
-          note: noteParts.join(' / ').substring(0, 480),
-        });
+          for (const row of chunk) {
+            const result = map.get(row.trackingNo);
+            if (result && result.status !== '取得失敗') {
+              successCount++;
+              resultsByRow.set(row.rowIndex, result);
+            } else {
+              errorCount++;
+              resultsByRow.set(
+                row.rowIndex,
+                result || { status: '取得失敗', detail: '結果が返りませんでした', history: [] }
+              );
+            }
+          }
 
-        if (verdict.flag && !alreadyNotified) {
-          flagged.push({
-            rowIndex: row.rowIndex,
-            orderNo: row.orderNo,
-            carrier: row.carrierName,
-            trackingNo: row.trackingNo,
-            status: displayStatus,
-            flag: verdict.flag,
-            note: noteParts.join(' / '),
-          });
+          if (i + chunkSize < carrierRows.length) await sleep(config.REQUEST_INTERVAL_MS);
         }
-
-        if (i < limited.length - 1) await sleep(config.REQUEST_INTERVAL_MS);
       }
     } finally {
       await closeBrowser(browser);
     }
   }
 
-  // ── 3. シートへまとめて書き戻し ──────────────────────────
+  // ── 3. 返品候補かどうかを判定 ────────────────────────────
+  for (const row of limited) {
+    const result =
+      resultsByRow.get(row.rowIndex) ||
+      { status: '取得失敗', detail: '照会されませんでした', history: [] };
+
+    // ヤマトの文言判定を止めたいときは YAMATO_STATUS_JUDGE=off にする
+    const trustStatus = row.carrierName !== 'ヤマト' || config.YAMATO_STATUS_JUDGE;
+
+    const verdict = judge({
+      status: result.status,
+      history: result.history || [],
+      shipDate: row.shipDate,
+      trustStatus,
+    });
+
+    const noteParts = [];
+    if (result.detail) noteParts.push(result.detail);
+    if (verdict.notes.length) noteParts.push(...verdict.notes);
+
+    // 一度立った通知済フラグは消さない（同じ荷物で何度も通知しないため）
+    const alreadyNotified = row.notified === 'TRUE';
+    const notified = verdict.flag && !alreadyNotified ? 'TRUE' : row.notified;
+
+    const displayStatus = verdict.effectiveStatus || result.status;
+
+    updates.push({
+      rowIndex: row.rowIndex,
+      status: displayStatus,
+      checkedAt,
+      returnFlag: verdict.flag,
+      notified,
+      note: noteParts.join(' / ').substring(0, 480),
+    });
+
+    if (verdict.flag && !alreadyNotified) {
+      flagged.push({
+        rowIndex: row.rowIndex,
+        orderNo: row.orderNo,
+        carrier: row.carrierName,
+        trackingNo: row.trackingNo,
+        status: displayStatus,
+        flag: verdict.flag,
+        note: noteParts.join(' / '),
+      });
+    }
+  }
+
+  // ── 4. シートへまとめて書き戻し ──────────────────────────
   await sheets.writeRows(updates);
 
-  // ── 4. まとめ ────────────────────────────────────────────
+  // ── 5. まとめ ────────────────────────────────────────────
   const elapsedSec = ((Date.now() - startedAt) / 1000).toFixed(1);
   const summary = {
     シート内の伝票: rows.length,

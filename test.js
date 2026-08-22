@@ -134,6 +134,28 @@ check('766154809302 の履歴件数', String(y2.historyCount), '3');
 
 check('ハイフン付き番号への変換', yamato.trackingNoVariants('766171888193')[1], '7661-7188-8193');
 
+// ── まとめ照会（複数件を1回で検索した場合）の分割テスト ──────
+const YAMATO_MULTI = [
+  '個人のお客さま', '荷物お問い合わせシステム', '送り状番号検索',
+  '日付', '配送状況', '08/21', '陸・海上切替え', '08/08', '配達完了',
+  '一覧印刷', 'T2', '画面を閉じる',
+  YAMATO_RETURNED.split('1件目：7661-7188-8193')[1] ? '' : '',
+].filter(Boolean).join('\n') + '\n1件目：7661-7188-8193\n'
+  + YAMATO_RETURNED.split('1件目：7661-7188-8193\n')[1]
+  + '\n2件目：7661-5480-9302\n'
+  + YAMATO_DELIVERED.split('1件目：7661-5480-9302\n')[1];
+
+const blocks = yamato.splitByItem(YAMATO_MULTI);
+check('まとめ照会: 2件に分割できる', String(blocks.length), '2');
+check('まとめ照会: 1件目の番号', blocks[0] ? blocks[0].trackingNo : '-', '766171888193');
+check('まとめ照会: 2件目の番号', blocks[1] ? blocks[1].trackingNo : '-', '766154809302');
+
+const b1 = yamato.parsePageText(blocks[0].text);
+const b2 = yamato.parsePageText(blocks[1].text);
+check('まとめ照会: 1件目の履歴に返品', String(b1.history.includes('返品')), 'true');
+check('まとめ照会: 2件目は配達完了', b2.status, '配達完了');
+check('まとめ照会: 1件目の履歴が2件目に混ざらない', String(b2.history.includes('返品')), 'false');
+
 console.log('\n=== 返品候補の判定テスト ===\n');
 
 // ★ 今回の最重要ケース: 返品なのに「配達完了」と誤判定していた行

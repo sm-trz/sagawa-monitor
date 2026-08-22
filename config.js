@@ -38,6 +38,10 @@ module.exports = {
   // 滞留日数だけの判定に戻せる。
   YAMATO_STATUS_JUDGE: (process.env.YAMATO_STATUS_JUDGE || 'on') === 'on',
 
+  // ヤマトを1回の検索で何件まとめて照会するか（1〜10）。
+  // 1 にすると従来どおり1件ずつになる。
+  YAMATO_BATCH_SIZE: num(process.env.YAMATO_BATCH_SIZE, 10),
+
   // ── 実行の保護 ─────────────────────────────────────────────
   // 値を設定すると /run?token=その値 でないと実行できなくなる（空なら無効）
   RUN_TOKEN: process.env.RUN_TOKEN || '',

@@ -234,4 +234,7 @@ async function fetchStatus(browser, trackingNo) {
   });
 }
 
-module.exports = { NAME, fetchStatus, parsePageText, normalizeStatus };
+// 佐川はURLに送り状番号を1件ずつ指定する方式のため、まとめ照会はしない
+const BATCH_SIZE = 1;
+
+module.exports = { NAME, BATCH_SIZE, fetchStatus, parsePageText, normalizeStatus };
