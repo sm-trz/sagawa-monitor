@@ -42,6 +42,33 @@ module.exports = {
   // 1 にすると従来どおり1件ずつになる。
   YAMATO_BATCH_SIZE: num(process.env.YAMATO_BATCH_SIZE, 10),
 
+  // ── 保管期限 ───────────────────────────────────────────────
+  // 持ち帰り（不在）から何日で差出人へ返送されるか。
+  // 公式FAQの記載に合わせて調整できるよう環境変数にしている。
+  SAGAWA_HOLD_DAYS: num(process.env.SAGAWA_HOLD_DAYS, 8),
+  YAMATO_HOLD_DAYS: num(process.env.YAMATO_HOLD_DAYS, 7),
+
+  // ヤマトは追跡ページに営業所の電話番号が出ないため、固定の連絡先を設定できる
+  YAMATO_CONTACT_TEL: process.env.YAMATO_CONTACT_TEL || '',
+
+  // ── カート（管理画面）へのリンク ───────────────────────────
+  // 注文番号が数字だけのときに、この後ろに注文番号をつなげて通知に載せる
+  CART_URL_PREFIX:
+    process.env.CART_URL_PREFIX ||
+    'https://beautymakelabo.jp/admin/order/edit.php?mode=pre_edit&order_id=',
+
+  // ── 通知（Chatwork） ───────────────────────────────────────
+  // トークンは Secret Manager から環境変数として渡す。
+  // 両方そろっている場合だけ通知が有効になる。
+  CHATWORK_API_TOKEN: process.env.CHATWORK_API_TOKEN || '',
+  CHATWORK_ROOM_ID: process.env.CHATWORK_ROOM_ID || '',
+
+  // テスト用ルーム（/run?mode=test と /test-notify の送信先）
+  CHATWORK_ROOM_ID_TEST: process.env.CHATWORK_ROOM_ID_TEST || '',
+
+  // 'off' にすると、検知しても通知を送らない（テスト用）
+  NOTIFY: (process.env.NOTIFY || 'on') === 'on',
+
   // ── 実行の保護 ─────────────────────────────────────────────
   // 値を設定すると /run?token=その値 でないと実行できなくなる（空なら無効）
   RUN_TOKEN: process.env.RUN_TOKEN || '',

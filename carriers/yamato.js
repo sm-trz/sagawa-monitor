@@ -47,6 +47,7 @@
 const logger = require('../logger');
 const config = require('../config');
 const { withPage } = require('../browser');
+const { toDateTime } = require('../datetime');
 
 const NAME = 'ヤマト';
 const SEARCH_URL = 'https://toi.kuronekoyamato.co.jp/cgi-bin/tneko';
@@ -120,10 +121,33 @@ function splitByItem(text) {
 }
 
 /**
+ * ヤマトの履歴には年が表示されない（例: "08月10日 16:13"）。
+ * そのため年を補う必要がある。
+ *
+ * ルール: いったん今年として計算し、それが「明日より未来」になるなら前年とみなす。
+ * 12月28日に発送した荷物を1月5日に照会しても正しく前年と判定できる。
+ * 推測ではなく、必ず同じ結果になる決まったルールで補完している。
+ */
+function inferShipDate(datetime, now = new Date()) {
+  const m = String(datetime || '').match(/(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
+  if (!m) return '';
+
+  const month = Number(m[1]);
+  const day = Number(m[2]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return '';
+
+  let year = now.getFullYear();
+  const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+  if (new Date(year, month - 1, day) > tomorrow) year -= 1;
+
+  return `${year}/${String(month).padStart(2, '0')}/${String(day).padStart(2, '0')}`;
+}
+
+/**
  * 1件分のかたまりから履歴を取り出す。
  * 「ラベル行 → 日時行 → 営業所行」の並びだけを信用する。
  */
-function parsePageText(text) {
+function parsePageText(text, now = new Date()) {
   const lines = (text || '').split('\n').map((l) => l.replace(/　/g, ' ').trim());
 
   const history = [];
@@ -148,10 +172,30 @@ function parsePageText(text) {
       detail: 'ページから履歴を読み取れませんでした',
       history: [],
       historyCount: 0,
+      shipDate: '',
+      deliveredAt: '',
+      heldAt: '',
+      returnedAt: '',
+      attemptedDelivery: false,
+      office: '',
+      officeTel: '',
     };
   }
 
   const latest = history[history.length - 1];
+  // 履歴の一番古い記録（荷物受付・発送済み）を集荷日とみなす
+  const shipDate = inferShipDate(history[0].datetime, now);
+
+  const find = (set) => history.find((h) => set.includes(h.status));
+  const delivered = find(['配達完了']);
+  const held = find(['持戻り', '保管中', '長期不在']);
+  const returned = find(['返品', '返送', '受取拒否', '受取辞退']);
+
+  // 佐川と同じ考え方。配達を試みた記録があれば「保管中」を持ち帰りとみなす。
+  const attemptedDelivery = history.some((h) => h.status === '配達中');
+
+  const toDT = (dt) => (dt ? toDateTime(dt, shipDate, now) : '');
+
   return {
     status: latest.status,
     rawStatus: latest.label,
@@ -159,6 +203,13 @@ function parsePageText(text) {
     history: history.map((h) => h.status),
     historyDetail: history,
     historyCount: history.length,
+    shipDate,
+    deliveredAt: toDT(delivered && delivered.datetime),
+    heldAt: toDT(held && held.datetime),
+    returnedAt: toDT(returned && returned.datetime),
+    attemptedDelivery,
+    office: latest.office || '',
+    officeTel: config.YAMATO_CONTACT_TEL || '',
   };
 }
 
@@ -214,6 +265,13 @@ const NOT_FOUND = {
   detail: '検索結果に伝票番号が見つかりません',
   history: [],
   historyCount: 0,
+  shipDate: '',
+  deliveredAt: '',
+  heldAt: '',
+  returnedAt: '',
+  attemptedDelivery: false,
+  office: '',
+  officeTel: '',
 };
 
 /**
@@ -295,6 +353,7 @@ module.exports = {
   fetchStatusBatch,
   parsePageText,
   splitByItem,
+  inferShipDate,
   normalizeStatus,
   trackingNoVariants,
 };

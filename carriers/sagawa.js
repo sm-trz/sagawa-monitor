@@ -32,6 +32,7 @@
 const logger = require('../logger');
 const config = require('../config');
 const { withPage } = require('../browser');
+const { toDateTime } = require('../datetime');
 
 const NAME = '佐川';
 const URL_BASE = 'https://k2k.sagawa-exp.co.jp/p/web/okurijosearch.do?okurijoNo=';
@@ -120,6 +121,37 @@ function parseHeadline(lines, trackingNo) {
   return { status: '', detail: '' };
 }
 
+/**
+ * 「出荷日 2026年08月07日」から集荷日を取り出す。
+ * 佐川は年まで表示されるため、そのまま使える。
+ * 返品後の「調査中」ページ（履歴が消えている）にも出荷日は残っていた。
+ */
+function parseShipDate(lines) {
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].includes('出荷日')) continue;
+    const target = `${lines[i]}\n${lines[i + 1] || ''}`;
+    const m = target.match(/(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
+    if (m) {
+      return `${m[1]}/${String(m[2]).padStart(2, '0')}/${String(m[3]).padStart(2, '0')}`;
+    }
+  }
+  return '';
+}
+
+/**
+ * 「配達に関するお問い合せ　荒川営業所  TEL:0570-01-0659」から
+ * 営業所名と電話番号を取り出す。再配達の案内先として通知に載せる。
+ */
+function parseOffice(lines) {
+  for (const line of lines) {
+    if (!line.includes('配達に関する')) continue;
+    const name = (line.match(/([^\s\t]+営業所)/) || [])[1] || '';
+    const tel = (line.match(/TEL[:：]\s*([0-9\-]+)/) || [])[1] || '';
+    if (name || tel) return { name, tel };
+  }
+  return { name: '', tel: '' };
+}
+
 /** 「配達予定日」「配達完了日」など、人が見て役立つ情報を拾う */
 function parseExtraInfo(lines) {
   const parts = [];
@@ -143,6 +175,8 @@ function parsePageText(text, trackingNo) {
   const history = parseHistory(lines);
   const headline = parseHeadline(lines, trackingNo);
   const extra = parseExtraInfo(lines);
+  const shipDate = parseShipDate(lines);
+  const office = parseOffice(lines);
 
   // 最優先: 「⇒」が付いた履歴行。無ければ履歴の最後の行。
   const latestFromHistory =
@@ -166,6 +200,13 @@ function parsePageText(text, trackingNo) {
       detail: 'ページからステータスを読み取れませんでした',
       history: [],
       historyCount: 0,
+      shipDate,
+      deliveredAt: '',
+      heldAt: '',
+      returnedAt: '',
+      attemptedDelivery: false,
+      office: office.name,
+      officeTel: office.tel,
       source: 'none',
     };
   }
@@ -178,13 +219,41 @@ function parsePageText(text, trackingNo) {
   if (extra) detailParts.push(extra);
   if (source === 'headline') detailParts.push('※履歴テーブルなし');
 
+  // 履歴を正規化し、必要な日時を取り出す
+  const steps = history.map((h) => ({ ...h, status: normalizeStatus(h.label) }));
+  const find = (set) => steps.find((s) => set.includes(s.status));
+
+  const delivered = find(['配達完了']);
+  const held = find(['持戻り', '保管中', '長期不在']);
+  const returned = find(['返品', '返送', '受取拒否', '受取辞退']);
+
+  // 「保管中」が持ち帰りなのか配達前の一時保管なのかを見分けるための材料。
+  // 配達を試みた記録（配達中）があれば持ち帰りとみなす。
+  const attemptedDelivery = steps.some((s) => s.status === '配達中');
+
+  const toDT = (dt) => (dt ? toDateTime(dt, shipDate) : '');
+
+  // 履歴が無いページでも「配達完了日　08月19日 18時23分」から拾えることがある
+  let deliveredAt = toDT(delivered && delivered.datetime);
+  if (!deliveredAt) {
+    const m = (extra || '').match(/配達完了日[^0-9]*(\d{1,2}月\d{1,2}日\s*\d{1,2}時\d{1,2}分)/);
+    if (m) deliveredAt = toDateTime(m[1], shipDate);
+  }
+
   return {
     status: normalizeStatus(rawStatus),
     rawStatus,
     detail: detailParts.join(' / '),
-    history: history.map((h) => normalizeStatus(h.label)),
-    historyDetail: history,
+    history: steps.map((s) => s.status),
+    historyDetail: steps,
     historyCount: history.length,
+    shipDate,
+    deliveredAt,
+    heldAt: toDT(held && held.datetime),
+    returnedAt: toDT(returned && returned.datetime),
+    attemptedDelivery,
+    office: office.name,
+    officeTel: office.tel,
     source,
   };
 }
@@ -221,6 +290,7 @@ async function fetchStatus(browser, trackingNo) {
         detail: 'JavaScript が実行されていません',
         history: [],
         historyCount: 0,
+        shipDate: '',
       };
     }
 
@@ -237,4 +307,12 @@ async function fetchStatus(browser, trackingNo) {
 // 佐川はURLに送り状番号を1件ずつ指定する方式のため、まとめ照会はしない
 const BATCH_SIZE = 1;
 
-module.exports = { NAME, BATCH_SIZE, fetchStatus, parsePageText, normalizeStatus };
+module.exports = {
+  NAME,
+  BATCH_SIZE,
+  fetchStatus,
+  parsePageText,
+  parseShipDate,
+  parseOffice,
+  normalizeStatus,
+};

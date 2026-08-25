@@ -16,6 +16,7 @@ require('dotenv').config();
 
 const http = require('http');
 const { runMonitor } = require('./monitor');
+const notifiers = require('./notifiers');
 const logger = require('./logger');
 const config = require('./config');
 
@@ -32,10 +33,12 @@ function sendJson(res, code, body) {
 const server = http.createServer(async (req, res) => {
   let path = '/';
   let token = null;
+  let mode = null;
   try {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     path = url.pathname;
     token = url.searchParams.get('token');
+    mode = url.searchParams.get('mode');
   } catch (_) {
     return sendJson(res, 400, { status: 'error', message: 'リクエストを解釈できません' });
   }
@@ -51,20 +54,42 @@ const server = http.createServer(async (req, res) => {
       service: 'sagawa-monitor',
       message: 'このURLでは監視は実行されません。実行するには末尾に /run を付けてください。',
       endpoints: {
-        run: 'GET /run （ブラウザ用） / POST /run （Cloud Scheduler 用）',
+        run: 'GET /run （ブラウザ用） / POST /run （Cloud Scheduler 用）→ 本番ルームへ通知',
+        runTest: 'GET /run?mode=test → テストルームへ通知',
+        testNotify: 'GET /test-notify → シートを触らずテスト通知だけ送る',
         health: 'GET /health',
       },
       settings: {
         'シート名': config.SHEET_NAME,
-        '滞留とみなす日数': config.STALE_DAYS,
         '監視を打ち切る日数': config.MAX_MONITOR_DAYS,
         '1回の最大照会件数': config.MAX_PER_RUN,
         '照会間隔ミリ秒': config.REQUEST_INTERVAL_MS,
-        'ヤマトの文言判定': config.YAMATO_STATUS_JUDGE ? 'on' : 'off（滞留検知のみ）',
+        'ヤマトの文言判定': config.YAMATO_STATUS_JUDGE ? 'on' : 'off',
+        '保管日数（佐川/ヤマト）': `${config.SAGAWA_HOLD_DAYS} / ${config.YAMATO_HOLD_DAYS}`,
+        '通知': config.NOTIFY ? 'on' : 'off',
+        '本番ルーム設定済み': Boolean(config.CHATWORK_ROOM_ID),
+        'テストルーム設定済み': Boolean(config.CHATWORK_ROOM_ID_TEST),
         'ページ本文のログ出力': config.DUMP_PAGE_TEXT ? 'on' : 'off',
       },
       running,
     });
+  }
+
+  // 設定確認用。シートには一切触らず、テストルームへ1通だけ送る。
+  if (path === '/test-notify') {
+    try {
+      const r = await notifiers.sendTestMessage();
+      return sendJson(res, r.ok ? 200 : 500, {
+        status: r.ok ? 'ok' : 'error',
+        message: r.ok
+          ? 'テストルームへ通知を送信しました。Chatworkを確認してください。'
+          : 'send に失敗しました。ログで [Chatwork] を検索してください。',
+        detail: r,
+      });
+    } catch (err) {
+      logger.error('テスト通知に失敗しました', { error: err.message });
+      return sendJson(res, 500, { status: 'error', message: err.message });
+    }
   }
 
   if (path === '/run') {
@@ -79,8 +104,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     running = true;
+    const isTest = mode === 'test';
     try {
-      const result = await runMonitor();
+      const result = await runMonitor({ isTest });
       return sendJson(res, 200, { status: 'ok', result });
     } catch (err) {
       logger.error('監視処理でエラーが発生しました', {
