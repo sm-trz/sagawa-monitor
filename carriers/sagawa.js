@@ -52,6 +52,8 @@ const NORMALIZE = [
   { canonical: '返送', patterns: ['返送', '差出人返送', '差出人へ返送'] },
   { canonical: '返品', patterns: ['返品'] },
   { canonical: '荷物受付', patterns: ['荷物受付', '出荷情報受付'] },
+  // お客様が日時や住所を指定し直した状態。配送は進むので通知しない。
+  { canonical: '変更受付', patterns: ['日時変更受付', '日時変更', '住所変更受付', '住所変更', '変更受付'] },
 ];
 
 /**

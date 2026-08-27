@@ -69,6 +69,8 @@ const server = http.createServer(async (req, res) => {
         '通知': config.NOTIFY ? 'on' : 'off',
         '本番ルーム設定済み': Boolean(config.CHATWORK_ROOM_ID),
         'テストルーム設定済み': Boolean(config.CHATWORK_ROOM_ID_TEST),
+        '通知の形': config.CHATWORK_NOTIFY_MODE === 'message' ? 'メッセージ' : 'タスク（1件ずつ）',
+        'タスク担当者': config.CHATWORK_TASK_TO_IDS || 'ルームの参加者全員',
         'ページ本文のログ出力': config.DUMP_PAGE_TEXT ? 'on' : 'off',
       },
       running,
@@ -82,7 +84,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, r.ok ? 200 : 500, {
         status: r.ok ? 'ok' : 'error',
         message: r.ok
-          ? 'テストルームへ通知を送信しました。Chatworkを確認してください。'
+          ? 'テストルームへ送信しました。Chatworkのタスクを確認してください。'
           : 'send に失敗しました。ログで [Chatwork] を検索してください。',
         detail: r,
       });

@@ -12,7 +12,8 @@ const sagawa = require('./carriers/sagawa');
 const yamato = require('./carriers/yamato');
 const { judge, shouldNotify, returnDeadline } = require('./judge');
 const { toDateTime } = require('./datetime');
-const { buildItem, cartUrl, buildMessage } = require('./notifiers');
+const { buildItem, cartUrl, titleOf, trackingLink } = require('./notifiers');
+const { toLimitUnix } = require('./notifiers/chatwork');
 
 let passed = 0;
 let failed = 0;
@@ -199,6 +200,15 @@ check('履歴に返品 → H列に「返品」と記録', jReturned.effectiveSta
 const jFail = judge({ status: '取得失敗', carrierName: '佐川', now: NOW });
 check('取得失敗 → 要調査', jFail.flag, '要調査');
 
+// お客様が日時を指定し直した状態。こちらが動く必要はないので通知しない
+const jChange = judge({ status: '変更受付', shipDate: '2026/08/20', carrierName: '佐川', now: NOW });
+check('日時変更受付 → 通知しない', jChange.flag || '(なし)', '(なし)');
+
+// 知らない文言で通知すると、配送会社が表記を変えるたびに誤通知が出る
+const jUnknown = judge({ status: '謎のステータス', shipDate: '2026/08/20', carrierName: '佐川', now: NOW });
+check('未知の文言 → 通知しない', jUnknown.flag, '経過観察');
+check('未知の文言 → 備考に残す', String(jUnknown.notes.some((n) => n.includes('謎のステータス'))), 'true');
+
 const jOff = judge({ status: '持戻り', heldAt: '2026/08/22 10:00', carrierName: 'ヤマト', trustStatus: false, now: NOW });
 check('ヤマト判定オフ → 通知しない', jOff.flag || '(なし)', '(なし)');
 
@@ -236,18 +246,43 @@ const item = {
   office: '宜野湾営業所', officeTel: '',
   deadline: { date: '2026/08/27', daysLeft: 4 },
 };
-const body = buildItem(item);
+const body = buildItem(item, { withTitle: true });
 check('氏名が入る', String(body.includes('山田 太郎 様')), 'true');
 check('電話番号が入る', String(body.includes('090-1234-5678')), 'true');
 check('返送予定が入る', String(body.includes('あと4日')), 'true');
 check('カートURLが入る', String(body.includes('order_id=52406')), 'true');
+check('1行目が見出しになる', body.split('\n')[0], '【要確認】お客様へのご連絡をお願いします');
 
-const msg = buildMessage([item], { isTest: true });
-check('テスト時は【テスト】が付く', String(msg.includes('【テスト】')), 'true');
-check('infoタグで囲む', String(msg.startsWith('[info]') && msg.endsWith('[/info]')), 'true');
+const testBody = buildItem(item, { withTitle: true, isTest: true });
+check('テスト時は【テスト】が付く', String(testBody.startsWith('【テスト】')), 'true');
 
-const msgReturned = buildMessage([{ ...item, flag: '返品確定', status: '返品' }]);
-check('返品確定は返品処理を依頼', String(msgReturned.includes('返品理由を確認')), 'true');
+const returnedBody = buildItem({ ...item, flag: '返品確定', status: '返品' }, { withTitle: true });
+check('返品確定の見出し', returnedBody.split('\n')[0], '【返品確定】返品処理をお願いします');
+check('返品確定は返品処理を依頼', String(returnedBody.includes('返品理由を確認')), 'true');
+
+section('配送会社へのリンク');
+
+// 佐川はURLを直接開けば配送状況が出る（実データで確認済み）
+const sTrack = trackingLink('佐川', '444803019555');
+check('佐川のラベル', sTrack.label, '配送状況');
+check('佐川のURL', sTrack.url, 'https://k2k.sagawa-exp.co.jp/p/web/okurijosearch.do?okurijoNo=444803019555');
+
+// ヤマトの追跡ページは直接開いても空なので、日時変更ページを案内する
+const yTrack = trackingLink('ヤマト', '766171888193');
+check('ヤマトのラベル', yTrack.label, '日時変更');
+check('ヤマトのURL', yTrack.url, 'https://jizen.kuronekoyamato.co.jp/jizen/servlet/crjz.b.NQ0010?id=766171888193');
+
+check('ハイフン入りでも数字だけにする', trackingLink('ヤマト', '7661-7188-8193').url.endsWith('id=766171888193') ? 'ok' : 'ng', 'ok');
+check('伝票番号なし → リンクなし', String(trackingLink('佐川', '')), 'null');
+check('未知の配送会社 → リンクなし', String(trackingLink('その他', '123')), 'null');
+check('通知にリンクが入る', String(buildItem(item).includes('okurijosearch.do?okurijoNo=766171888193') || buildItem({ ...item, carrier: '佐川' }).includes('okurijosearch.do')), 'true');
+
+section('Chatworkタスクの期限');
+
+// limit_type=date で使うUnix時間。時差で前日にならないよう日本時間の正午にする
+check('2026/08/30 → Unix時間', String(toLimitUnix('2026/08/30')), String(Date.UTC(2026, 7, 30, 3) / 1000));
+check('日付として解釈できる', new Date(toLimitUnix('2026/08/30') * 1000).toISOString().slice(0, 10), '2026-08-30');
+check('日付なし → null', String(toLimitUnix('')), 'null');
 
 console.log('\n----------------------------------------');
 console.log(`  合格 ${passed} 件 / 不合格 ${failed} 件`);

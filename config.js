@@ -51,6 +51,18 @@ module.exports = {
   // ヤマトは追跡ページに営業所の電話番号が出ないため、固定の連絡先を設定できる
   YAMATO_CONTACT_TEL: process.env.YAMATO_CONTACT_TEL || '',
 
+  // ── 配送会社の追跡ページ ───────────────────────────────────
+  // 伝票番号をそのまま後ろにつなげる。
+  // 佐川はURLを直接開けば配送状況が表示される（実データで確認済み）。
+  // ヤマトは追跡ページを直接開いても結果が出ないため、
+  // 「受け取り日時・場所の変更」ページを案内する。
+  SAGAWA_TRACK_URL_PREFIX:
+    process.env.SAGAWA_TRACK_URL_PREFIX ||
+    'https://k2k.sagawa-exp.co.jp/p/web/okurijosearch.do?okurijoNo=',
+  YAMATO_TRACK_URL_PREFIX:
+    process.env.YAMATO_TRACK_URL_PREFIX ||
+    'https://jizen.kuronekoyamato.co.jp/jizen/servlet/crjz.b.NQ0010?id=',
+
   // ── カート（管理画面）へのリンク ───────────────────────────
   // 注文番号が数字だけのときに、この後ろに注文番号をつなげて通知に載せる
   CART_URL_PREFIX:
@@ -66,8 +78,31 @@ module.exports = {
   // テスト用ルーム（/run?mode=test と /test-notify の送信先）
   CHATWORK_ROOM_ID_TEST: process.env.CHATWORK_ROOM_ID_TEST || '',
 
+  // 運用専用ルーム（システムエラーと日次サマリの送信先）。
+  // 業務委託者グループには絶対に流さないよう、未設定のときは
+  // テストルームへ送り、それも無ければ送信しない。
+  CHATWORK_ROOM_ID_ALERT: process.env.CHATWORK_ROOM_ID_ALERT || '',
+
+  // 'task' = タスクとして作る（既定） / 'message' = 通常メッセージで送る
+  CHATWORK_NOTIFY_MODE: process.env.CHATWORK_NOTIFY_MODE || 'task',
+
+  // タスクの担当者にするアカウントID（カンマ区切り）。
+  // 空にしておくと、ルームの参加者（閲覧のみを除く）全員が担当者になる。
+  CHATWORK_TASK_TO_IDS: process.env.CHATWORK_TASK_TO_IDS || '',
+
+  // 1件ずつ送るときの間隔（Chatworkの回数制限対策）
+  CHATWORK_INTERVAL_MS: num(process.env.CHATWORK_INTERVAL_MS, 600),
+
   // 'off' にすると、検知しても通知を送らない（テスト用）
   NOTIFY: (process.env.NOTIFY || 'on') === 'on',
+
+  // ── 異常の検知 ─────────────────────────────────────────────
+  // 取得失敗がこの件数以上、またはこの割合以上になったら即座に通知する
+  ERROR_ALERT_MIN_COUNT: num(process.env.ERROR_ALERT_MIN_COUNT, 3),
+  ERROR_ALERT_MIN_RATIO: Number(process.env.ERROR_ALERT_MIN_RATIO || '0.3'),
+
+  // 日次サマリを送る時刻（この時間帯の実行のあとに送る）
+  DAILY_SUMMARY_HOUR: num(process.env.DAILY_SUMMARY_HOUR, 17),
 
   // ── 実行の保護 ─────────────────────────────────────────────
   // 値を設定すると /run?token=その値 でないと実行できなくなる（空なら無効）
