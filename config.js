@@ -31,6 +31,26 @@ module.exports = {
   // 1件あたりのページ表示待ち（ミリ秒）
   PAGE_TIMEOUT_MS: num(process.env.PAGE_TIMEOUT_MS, 30000),
 
+  // ── 配送会社の一時停止 ─────────────────────────────────────
+  // 配送会社側がサービスを止めているときに、その会社だけ照会をやめる。
+  // カンマ区切りで複数指定できる。表記ゆれ（佐川急便など）も通る。
+  //
+  //   例: PAUSED_CARRIERS=佐川
+  //
+  // 止めた会社の行は、照会も判定も通知も行わない。
+  // 最終ステータスや判定はそのまま残し、備考に印だけ付ける。
+  // 復旧したら、この環境変数を空にして戻すだけでよい。
+  //
+  // 2026-10-01 佐川急便が不正アクセスにより
+  // 「お荷物問い合わせサービス」を停止したため追加した。
+  PAUSED_CARRIERS: String(process.env.PAUSED_CARRIERS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+
+  // 停止中の行の備考に残す文言
+  PAUSED_NOTE: process.env.PAUSED_NOTE || '配送会社都合で照会停止中',
+
   // ── ヤマト運輸 ─────────────────────────────────────────────
   // ヤマトのステータス文言で返品判定を行うか。
   // 実データ（返品・配達完了）で検証済みのため既定は 'on'。
@@ -100,6 +120,17 @@ module.exports = {
   // 取得失敗がこの件数以上、またはこの割合以上になったら即座に通知する
   ERROR_ALERT_MIN_COUNT: num(process.env.ERROR_ALERT_MIN_COUNT, 3),
   ERROR_ALERT_MIN_RATIO: Number(process.env.ERROR_ALERT_MIN_RATIO || '0.3'),
+
+  // ── 一斉に取得失敗したときの通知抑制 ───────────────────────
+  // 配送会社のサイトが落ちると、全件が「取得失敗 → 要調査」になり、
+  // 業務委託者へ大量のタスクが飛んでしまう。
+  // 個別の案件ではなくシステム障害なので、両方の条件を満たしたときは
+  // 業務委託者への通知を見送る（運用ルームへの異常通知は出す）。
+  //
+  // 件数と割合の "両方" を満たす必要がある。
+  // 数件だけの失敗は本当に調査すべきものかもしれないため、抑制しない。
+  FETCH_FAILURE_MUTE_MIN: num(process.env.FETCH_FAILURE_MUTE_MIN, 5),
+  FETCH_FAILURE_MUTE_RATIO: Number(process.env.FETCH_FAILURE_MUTE_RATIO || '0.5'),
 
   // 日次サマリを送る時刻（この時間帯の実行のあとに送る）
   DAILY_SUMMARY_HOUR: num(process.env.DAILY_SUMMARY_HOUR, 17),

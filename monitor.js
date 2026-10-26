@@ -38,12 +38,56 @@ function nowJST() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * 照会を止めている配送会社の一覧を作る。
+ * 環境変数の表記ゆれ（佐川急便 → 佐川）はここで吸収する。
+ *
+ * @returns {{names:Set<string>, unknown:string[]}}
+ */
+function pausedCarrierSet(rawList = config.PAUSED_CARRIERS) {
+  const names = new Set();
+  const unknown = [];
+  for (const raw of rawList || []) {
+    const name = normalizeCarrierName(raw);
+    if (name) names.add(name);
+    else unknown.push(String(raw));
+  }
+  return { names, unknown };
+}
+
+/**
+ * 一斉に取得失敗したときに、業務委託者への通知を見送るか。
+ *
+ * 配送会社のサイトが落ちると全件が「取得失敗 → 要調査」になる。
+ * これは個別の案件ではなくシステム障害なので、タスクを飛ばさない。
+ * 数件だけの失敗は本物かもしれないので抑制しない（件数と割合の両方を見る）。
+ */
+function shouldMuteFetchFailures(failed, checked) {
+  if (failed <= 0 || checked <= 0) return false;
+  if (failed < config.FETCH_FAILURE_MUTE_MIN) return false;
+  return failed / checked >= config.FETCH_FAILURE_MUTE_RATIO;
+}
+
+/**
+ * 停止中の行の備考を作る。すでに印が付いていれば、そのまま返す。
+ * @returns {string|null} 書き換える必要がなければ null
+ */
+function pauseNoteFor(currentNote) {
+  const note = String(currentNote || '');
+  if (note.includes(config.PAUSED_NOTE)) return null;
+  return [config.PAUSED_NOTE, note].filter(Boolean).join(' / ').substring(0, 480);
+}
+
+/**
  * 照会が必要な行だけを選ぶ。
  * 「配達完了は監視終了」「返品確定は監視終了」「古すぎるものは打ち切り」の実装。
+ *
+ * @param {Array} rows
+ * @param {Set<string>} pausedNames 照会を止めている配送会社
  */
-function selectTargets(rows) {
+function selectTargets(rows, pausedNames = new Set()) {
   const targets = [];
-  const skipped = { finished: 0, returned: 0, tooOld: 0, noCarrier: 0 };
+  const paused = [];
+  const skipped = { finished: 0, returned: 0, tooOld: 0, noCarrier: 0, paused: 0 };
   const carrierErrors = [];
 
   for (const row of rows) {
@@ -68,10 +112,19 @@ function selectTargets(rows) {
       });
       continue;
     }
+
+    // 配送会社側が止まっているあいだは照会しない。
+    // 判定も通知も行わず、シートの状態はそのまま残す。
+    if (pausedNames.has(carrierName)) {
+      skipped.paused++;
+      paused.push({ ...row, carrierName });
+      continue;
+    }
+
     targets.push({ ...row, carrierName });
   }
 
-  return { targets, skipped, carrierErrors };
+  return { targets, paused, skipped, carrierErrors };
 }
 
 async function fetchAll(limited) {
@@ -147,19 +200,29 @@ async function fetchAll(limited) {
  */
 async function runMonitor({ isTest = false } = {}) {
   const startedAt = Date.now();
+  const { names: pausedNames, unknown: pausedUnknown } = pausedCarrierSet();
+
   logger.info('====== 監視処理開始 ======', {
     モード: isTest ? 'テスト' : '本番',
     保管日数_佐川: config.SAGAWA_HOLD_DAYS,
     保管日数_ヤマト: config.YAMATO_HOLD_DAYS,
     監視打ち切り日数: config.MAX_MONITOR_DAYS,
     一回の上限件数: config.MAX_PER_RUN,
+    照会を止めている会社: pausedNames.size ? [...pausedNames].join(' / ') : 'なし',
   });
+
+  if (pausedUnknown.length) {
+    logger.warn('PAUSED_CARRIERS に知らない配送会社名が入っています（無視します）', {
+      値: pausedUnknown,
+      使える名前: supportedNames().join(' / '),
+    });
+  }
 
   // ── 1. シートを読む ──────────────────────────────────────
   await sheets.checkHeader();
   const rows = await sheets.fetchRows();
 
-  const { targets, skipped, carrierErrors } = selectTargets(rows);
+  const { targets, paused, skipped, carrierErrors } = selectTargets(rows, pausedNames);
   const limited = targets.slice(0, config.MAX_PER_RUN);
   if (targets.length > limited.length) {
     logger.warn(
@@ -175,16 +238,55 @@ async function runMonitor({ isTest = false } = {}) {
     返品確定で除外: skipped.returned,
     期限切れで除外: skipped.tooOld,
     配送会社未指定: skipped.noCarrier,
+    照会停止中で除外: skipped.paused,
   });
 
   // ── 2. 配送会社サイトを照会 ──────────────────────────────
   const { resultsByRow, counts } = await fetchAll(limited);
+
+  // 一斉に失敗しているなら配送会社側の障害とみなし、
+  // 業務委託者への通知を見送る（運用ルームへは後で知らせる）。
+  const muteFetchFailures = shouldMuteFetchFailures(counts.error, limited.length);
+  if (muteFetchFailures) {
+    logger.warn('取得失敗が多いため、業務委託者への通知を見送ります', {
+      取得失敗: counts.error,
+      照会した件数: limited.length,
+      判断基準: `${config.FETCH_FAILURE_MUTE_MIN}件以上 かつ ${Math.round(config.FETCH_FAILURE_MUTE_RATIO * 100)}%以上`,
+    });
+  }
 
   // ── 3. 判定 ──────────────────────────────────────────────
   const checkedAt = nowJST();
   const updates = [...carrierErrors];
   const flagged = [];
   const unknownStatuses = [];
+
+  // 照会を止めている行は、状態をそのままにして備考に印だけ残す。
+  // すでに印が付いている行は書き込まない（無駄な更新を避けるため）。
+  let pausedMarked = 0;
+  for (const row of paused) {
+    const note = pauseNoteFor(row.note);
+    if (note === null) continue;
+    pausedMarked++;
+    updates.push({
+      rowIndex: row.rowIndex,
+      writeShipDate: false,
+      shipDate: row.shipDate,
+      status: row.status,       // 照会していないので最後に取れた値を残す
+      checkedAt: row.checkedAt, // 確認していないので更新しない
+      flag: row.flag,
+      notified: row.notified,
+      deliveredAt: row.deliveredAt,
+      returnedAt: row.returnedAt,
+      note,
+    });
+  }
+  if (paused.length) {
+    logger.info(`照会を止めている会社の伝票が ${paused.length} 件あります`, {
+      会社: [...pausedNames].join(' / '),
+      備考に印を付けた件数: pausedMarked,
+    });
+  }
 
   for (const row of limited) {
     const result =
@@ -215,6 +317,14 @@ async function runMonitor({ isTest = false } = {}) {
     }
 
     const displayStatus = verdict.effectiveStatus || result.status;
+
+    // 一斉の取得失敗は配送会社側の障害。要調査にも通知にも上げない。
+    let flag = verdict.flag;
+    if (muteFetchFailures && result.status === '取得失敗') {
+      flag = FLAG_NONE;
+      noteParts.push('一斉に取得できないため配送会社側の障害とみなします（通知は見送り）');
+    }
+
     const note = noteParts.join(' / ').substring(0, 480);
 
     // 配送会社が新しい表記を使い始めたら、あとから気づけるよう集めておく
@@ -229,14 +339,14 @@ async function runMonitor({ isTest = false } = {}) {
       shipDate,
       status: displayStatus,
       checkedAt,
-      flag: verdict.flag,
+      flag,
       notified: row.notified, // 通知が成功したあとで書き換える
       deliveredAt: result.deliveredAt || row.deliveredAt || '',
       returnedAt: result.returnedAt || result.heldAt || row.returnedAt || '',
       note,
     });
 
-    if (shouldNotify(verdict.flag, row.notified)) {
+    if (shouldNotify(flag, row.notified)) {
       flagged.push({
         rowIndex: row.rowIndex,
         orderNo: row.orderNo,
@@ -249,7 +359,7 @@ async function runMonitor({ isTest = false } = {}) {
         heldAt: result.heldAt || '',
         returnedAt: result.returnedAt || '',
         status: displayStatus,
-        flag: verdict.flag,
+        flag,
         deadline: verdict.deadline,
         office: result.office || '',
         officeTel: result.officeTel || '',
@@ -289,11 +399,13 @@ async function runMonitor({ isTest = false } = {}) {
     返品確定で除外: skipped.returned,
     期限切れで除外: skipped.tooOld,
     配送会社未指定: skipped.noCarrier,
+    照会停止中で除外: skipped.paused,
     通知: flagged.length === 0
       ? '対象なし'
       : `${notifyResult.sentCount}件成功 / ${notifyResult.failed.length}件失敗`,
     所要秒数: Number(elapsedSec),
   };
+  if (muteFetchFailures) summary.取得失敗の通知 = '見送り（配送会社側の障害とみなしました）';
   logger.info('====== 監視処理完了 ======', summary);
 
   // ── 7. 異常の通知（運用ルームへ） ────────────────────────
@@ -306,6 +418,9 @@ async function runMonitor({ isTest = false } = {}) {
     未知のステータス: unknownStatuses,
     返品確定: flagged.filter((f) => f.flag === FLAG_RETURNED).length,
     要調査: flagged.filter((f) => f.flag !== FLAG_RETURNED).length,
+    照会停止中: skipped.paused,
+    停止中の会社: [...pausedNames],
+    通知を見送った: muteFetchFailures,
   });
 
   if (flagged.length > 0) {
@@ -347,11 +462,18 @@ async function reportProblems(stats) {
     failed >= config.ERROR_ALERT_MIN_COUNT || (checked > 0 && ratio >= config.ERROR_ALERT_MIN_RATIO);
 
   if (tooManyFailures) {
+    const muted = Boolean(stats.通知を見送った);
     await notifiers.notifyError({
       isTest: stats.isTest,
       title: `配送状況を取得できない伝票が ${failed} 件あります`,
-      detail: `照会 ${checked} 件中 ${failed} 件が失敗（${Math.round(ratio * 100)}%）`,
-      hint: 'ログで「ページ本文」を検索し、配送会社のページ構造が変わっていないか確認してください',
+      detail:
+        `照会 ${checked} 件中 ${failed} 件が失敗（${Math.round(ratio * 100)}%）` +
+        (muted
+          ? '\n※配送会社側の障害とみなし、業務委託者への通知は見送りました'
+          : ''),
+      hint: muted
+        ? '配送会社のサービス停止が続くなら、環境変数 PAUSED_CARRIERS にその会社名を入れて照会を止めてください'
+        : 'ログで「ページ本文」を検索し、配送会社のページ構造が変わっていないか確認してください',
     }).catch((e) => logger.error('異常通知に失敗しました', { error: e.message }));
   }
 
@@ -405,4 +527,11 @@ async function runMonitorGuarded(options = {}) {
   }
 }
 
-module.exports = { runMonitor: runMonitorGuarded, runMonitorInner: runMonitor, selectTargets };
+module.exports = {
+  runMonitor: runMonitorGuarded,
+  runMonitorInner: runMonitor,
+  selectTargets,
+  pausedCarrierSet,
+  shouldMuteFetchFailures,
+  pauseNoteFor,
+};

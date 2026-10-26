@@ -66,6 +66,10 @@ const server = http.createServer(async (req, res) => {
         '照会間隔ミリ秒': config.REQUEST_INTERVAL_MS,
         'ヤマトの文言判定': config.YAMATO_STATUS_JUDGE ? 'on' : 'off',
         '保管日数（佐川/ヤマト）': `${config.SAGAWA_HOLD_DAYS} / ${config.YAMATO_HOLD_DAYS}`,
+        '照会を止めている会社': config.PAUSED_CARRIERS.length
+          ? config.PAUSED_CARRIERS.join(' / ')
+          : 'なし',
+        '取得失敗の通知を見送る条件': `${config.FETCH_FAILURE_MUTE_MIN}件以上 かつ ${Math.round(config.FETCH_FAILURE_MUTE_RATIO * 100)}%以上`,
         '通知': config.NOTIFY ? 'on' : 'off',
         '本番ルーム設定済み': Boolean(config.CHATWORK_ROOM_ID),
         'テストルーム設定済み': Boolean(config.CHATWORK_ROOM_ID_TEST),

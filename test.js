@@ -14,6 +14,12 @@ const { judge, shouldNotify, returnDeadline } = require('./judge');
 const { toDateTime } = require('./datetime');
 const { buildItem, cartUrl, titleOf, trackingLink } = require('./notifiers');
 const { toLimitUnix } = require('./notifiers/chatwork');
+const {
+  selectTargets,
+  pausedCarrierSet,
+  shouldMuteFetchFailures,
+  pauseNoteFor,
+} = require('./monitor');
 
 let passed = 0;
 let failed = 0;
@@ -283,6 +289,78 @@ section('Chatworkタスクの期限');
 check('2026/08/30 → Unix時間', String(toLimitUnix('2026/08/30')), String(Date.UTC(2026, 7, 30, 3) / 1000));
 check('日付として解釈できる', new Date(toLimitUnix('2026/08/30') * 1000).toISOString().slice(0, 10), '2026-08-30');
 check('日付なし → null', String(toLimitUnix('')), 'null');
+
+// ══ 配送会社の一時停止 ══════════════════════════════════════
+// 2026-10-01 佐川急便が不正アクセスで追跡サービスを停止した。
+// 止めているあいだ、その会社の伝票は照会も判定も通知もしない。
+
+section('配送会社の一時停止');
+
+const ROW = (over = {}) => ({
+  rowIndex: 10,
+  orderNo: '53001',
+  carrierRaw: '佐川',
+  trackingNo: '444803064580',
+  shipDate: '2026/10/20',
+  name: '', address: '', tel: '',
+  status: '輸送中',
+  checkedAt: '2026/10/20 17:15:00',
+  flag: '',
+  notified: '',
+  deliveredAt: '', returnedAt: '', note: '',
+  ...over,
+});
+
+const pNone = pausedCarrierSet([]);
+check('既定では何も止めない', pNone.names.size, 0);
+
+const pSagawa = pausedCarrierSet(['佐川']);
+check('佐川を止められる', pSagawa.names.has('佐川'), true);
+check('ヤマトは止まらない', pSagawa.names.has('ヤマト'), false);
+
+const pAlias = pausedCarrierSet(['佐川急便', 'クロネコ']);
+check('表記ゆれを吸収する（佐川急便）', pAlias.names.has('佐川'), true);
+check('表記ゆれを吸収する（クロネコ）', pAlias.names.has('ヤマト'), true);
+
+const pBad = pausedCarrierSet(['日本郵便']);
+check('知らない会社は無視する', pBad.names.size, 0);
+check('知らない会社は警告用に残す', pBad.unknown[0], '日本郵便');
+
+const selPaused = selectTargets([ROW(), ROW({ rowIndex: 11, carrierRaw: 'ヤマト' })], pSagawa.names);
+check('止めた会社は照会しない', selPaused.targets.length, 1);
+check('照会されるのはヤマトだけ', selPaused.targets[0].carrierName, 'ヤマト');
+check('止めた行は paused に入る', selPaused.paused.length, 1);
+check('止めた件数を数える', selPaused.skipped.paused, 1);
+
+// 止めていても、配達完了や返品確定はこれまでどおり先に除外される
+const selDone = selectTargets([ROW({ status: '配達完了' })], pSagawa.names);
+check('配達完了は停止判定より先に除外', selDone.skipped.finished, 1);
+check('配達完了は paused に入らない', selDone.paused.length, 0);
+
+const selNoPause = selectTargets([ROW()], new Set());
+check('止めていなければ普通に照会する', selNoPause.targets.length, 1);
+
+section('停止中の備考');
+
+check('印を付ける', pauseNoteFor(''), '配送会社都合で照会停止中');
+check('元の備考は残す', pauseNoteFor('返送予定 2026/10/28'), '配送会社都合で照会停止中 / 返送予定 2026/10/28');
+check('すでに印があれば書き換えない', String(pauseNoteFor('配送会社都合で照会停止中 / 返送予定')), 'null');
+
+section('一斉取得失敗のときは通知を見送る');
+
+// 既定: 5件以上 かつ 50%以上 の両方を満たしたときだけ見送る
+check('24件中24件失敗 → 見送る', shouldMuteFetchFailures(24, 24), true);
+check('26件中24件失敗 → 見送る', shouldMuteFetchFailures(24, 26), true);
+check('10件中5件失敗 → 見送る', shouldMuteFetchFailures(5, 10), true);
+check('150件中3件失敗 → 見送らない', shouldMuteFetchFailures(3, 150), false);
+check('件数が足りなければ見送らない', shouldMuteFetchFailures(4, 5), false);
+check('割合が足りなければ見送らない', shouldMuteFetchFailures(10, 100), false);
+check('失敗0件なら見送らない', shouldMuteFetchFailures(0, 20), false);
+check('照会0件なら見送らない', shouldMuteFetchFailures(0, 0), false);
+
+// 見送っても「取得失敗」自体は記録に残す（事実を消さない）
+const jFailMuted = judge({ status: '取得失敗', carrierName: '佐川', now: NOW });
+check('取得失敗の判定そのものは変えない', jFailMuted.flag, '要調査');
 
 console.log('\n----------------------------------------');
 console.log(`  合格 ${passed} 件 / 不合格 ${failed} 件`);
