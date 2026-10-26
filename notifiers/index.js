@@ -293,11 +293,23 @@ async function notifyDailySummary(summary) {
   lines.push(`[title]${summary.isTest ? '【テスト】' : ''}【日次サマリ】${summary.日付}[/title]`);
   lines.push(`確認した伝票: ${summary.照会した件数}件`);
   lines.push(`検知: 返品確定 ${summary.返品確定}件 / 要調査 ${summary.要調査}件`);
+
+  // 照会を止めている会社があれば、戻し忘れを防ぐために毎回書く。
+  // ただし、これ自体はサマリを送る理由にはしない（止めている間ずっと続くため）。
+  if (summary.照会停止中 > 0) {
+    lines.push('');
+    lines.push(`照会を止めている会社: ${(summary.停止中の会社 || []).join(' / ')}（${summary.照会停止中}件）`);
+    lines.push('　復旧したら環境変数 PAUSED_CARRIERS を空にしてデプロイしてください');
+  }
+
   lines.push('');
   lines.push('▼気になる点');
   for (const p of problems) lines.push(`・${p}`);
   if (summary.未知のステータス.length > 0) {
     lines.push(`　→ ${summary.未知のステータス.join(' / ')}`);
+  }
+  if (summary.通知を見送った) {
+    lines.push('・取得失敗が多いため、業務委託者への通知は見送りました');
   }
   lines.push('');
   lines.push(sheetUrl());
