@@ -79,7 +79,15 @@ const NORMALIZE = [
   },
   { canonical: '荷物受付', patterns: ['荷物受付', '伝票番号発行'] },
   // お客様が日時や住所を指定し直した状態。配送は進むので通知しない。
-  { canonical: '変更受付', patterns: ['日時変更受付', '日時変更', '住所変更受付', '住所変更', '変更受付'] },
+  // 「依頼受付（再配達）」も、お客様自身が再配達を頼んだ状態なのでここに含める。
+  // （2026-11-03 実データで「未知のステータス」として検出されたため追加）
+  {
+    canonical: '変更受付',
+    patterns: [
+      '日時変更受付', '日時変更', '住所変更受付', '住所変更', '変更受付',
+      '依頼受付', '再配達受付', '受取場所変更',
+    ],
+  },
 ];
 
 function normalizeStatus(raw) {
@@ -258,8 +266,45 @@ async function runSearch(page, trackingNos) {
     await page.waitForTimeout(3000);
   }
 
-  const text = await page.evaluate(() => (document.body ? document.body.innerText : ''));
+  // 検索直後はページがまだ切り替わっている途中のことがあり、
+  // そのまま読もうとすると「Execution context was destroyed」で落ちる。
+  // 失敗したら少し待って1度だけ読み直す。
+  let text = '';
+  try {
+    text = await page.evaluate(() => (document.body ? document.body.innerText : ''));
+  } catch (e) {
+    logger.warn(`[ヤマト] ページの読み取りに失敗したので読み直します: ${e.message}`);
+    await page.waitForTimeout(2000);
+    text = await page.evaluate(() => (document.body ? document.body.innerText : ''));
+  }
   return { text, filled };
+}
+
+/**
+ * 照会をやり直せるようにしたもの。
+ *
+ * ページを開けなかったときに、ブラウザのページを作り直して試し直す。
+ * 以前は1回失敗しただけで、まとめて照会した10件すべてが「取得失敗」になっていた。
+ *
+ * @returns {Promise<{text:string, filled:string[]}>}
+ */
+async function searchWithRetry(browser, trackingNos) {
+  const attempts = Math.max(1, config.SEARCH_ATTEMPTS);
+  let lastError = null;
+
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await withPage(browser, (page) => runSearch(page, trackingNos));
+    } catch (e) {
+      lastError = e;
+      logger.warn(`[ヤマト] 照会に失敗しました（${i}/${attempts}回目）: ${e.message}`);
+      if (i < attempts) {
+        await new Promise((r) => setTimeout(r, config.RETRY_WAIT_MS));
+      }
+    }
+  }
+
+  throw lastError;
 }
 
 const NOT_FOUND = {
@@ -280,25 +325,23 @@ const NOT_FOUND = {
  * 1件だけ照会する（まとめ照会が失敗したときの保険にも使う）。
  */
 async function fetchStatus(browser, trackingNo) {
-  return withPage(browser, async (page) => {
-    const { text, filled } = await runSearch(page, [trackingNo]);
-    if (filled.length === 0) return { ...NOT_FOUND, detail: '検索フォームに入力できませんでした' };
+  const { text, filled } = await searchWithRetry(browser, [trackingNo]);
+  if (filled.length === 0) return { ...NOT_FOUND, detail: '検索フォームに入力できませんでした' };
 
-    if (config.DUMP_PAGE_TEXT) {
-      logger.info(`[ヤマト] ページ本文 ${trackingNo}: ${text.substring(0, config.DUMP_LENGTH)}`);
-    }
+  if (config.DUMP_PAGE_TEXT) {
+    logger.info(`[ヤマト] ページ本文 ${trackingNo}: ${text.substring(0, config.DUMP_LENGTH)}`);
+  }
 
-    const blocks = splitByItem(text);
-    const block = blocks.find((b) => b.trackingNo === trackingNo);
-    if (!block) return NOT_FOUND;
+  const blocks = splitByItem(text);
+  const block = blocks.find((b) => b.trackingNo === trackingNo);
+  if (!block) return NOT_FOUND;
 
-    const parsed = parsePageText(block.text);
-    logger.info(`[ヤマト] 判定 ${trackingNo} → ${parsed.status}`, {
-      rawStatus: parsed.rawStatus,
-      history: parsed.history,
-    });
-    return parsed;
+  const parsed = parsePageText(block.text);
+  logger.info(`[ヤマト] 判定 ${trackingNo} → ${parsed.status}`, {
+    rawStatus: parsed.rawStatus,
+    history: parsed.history,
   });
+  return parsed;
 }
 
 /**
@@ -309,7 +352,7 @@ async function fetchStatusBatch(browser, trackingNos) {
   const results = new Map();
   if (!trackingNos || trackingNos.length === 0) return results;
 
-  const { text, filled } = await withPage(browser, (page) => runSearch(page, trackingNos));
+  const { text, filled } = await searchWithRetry(browser, trackingNos);
 
   if (config.DUMP_PAGE_TEXT) {
     logger.info(
@@ -353,6 +396,7 @@ module.exports = {
   BATCH_SIZE,
   fetchStatus,
   fetchStatusBatch,
+  searchWithRetry,
   parsePageText,
   splitByItem,
   inferShipDate,

@@ -29,7 +29,17 @@ module.exports = {
   MAX_PER_RUN: num(process.env.MAX_PER_RUN, 150),
 
   // 1件あたりのページ表示待ち（ミリ秒）
-  PAGE_TIMEOUT_MS: num(process.env.PAGE_TIMEOUT_MS, 30000),
+  // 配送会社のサイトが混んでいると30秒では足りないことがあるため60秒にしている。
+  PAGE_TIMEOUT_MS: num(process.env.PAGE_TIMEOUT_MS, 60000),
+
+  // ── 照会のやり直し ─────────────────────────────────────────
+  // ページを開けなかったときに、何回まで試すか（1 ならやり直さない）。
+  // 「読み取り中にページが遷移した」「一瞬だけ応答がなかった」といった
+  // 1回きりの事故が多く、やり直すとたいてい通るため。
+  SEARCH_ATTEMPTS: num(process.env.SEARCH_ATTEMPTS, 3),
+
+  // やり直すまでの待ち時間（ミリ秒）
+  RETRY_WAIT_MS: num(process.env.RETRY_WAIT_MS, 5000),
 
   // ── 配送会社の一時停止 ─────────────────────────────────────
   // 配送会社側がサービスを止めているときに、その会社だけ照会をやめる。
@@ -115,6 +125,20 @@ module.exports = {
 
   // 'off' にすると、検知しても通知を送らない（テスト用）
   NOTIFY: (process.env.NOTIFY || 'on') === 'on',
+
+  // ── どこまでを「業務委託者へ通知する」とするか ─────────────
+  // 'on'  = 要調査として通知する
+  // 'off' = 経過観察として記録だけ残す（シートには出るが通知しない）
+  //
+  // 2026-10 に運用側と見直した結果の既定値。
+  //   取得失敗     … ページが読めなかっただけで委託者に打つ手がない → off
+  //   保管中(配達後) … 実データ1件だけを根拠にした推定ルール → off
+  //   調査中       … 佐川の返品はこれでしか分からない → on のまま
+  // 持戻り・長期不在・返品確定は、この設定に関係なく必ず通知する。
+  NOTIFY_ON_FETCH_ERROR: (process.env.NOTIFY_ON_FETCH_ERROR || 'off') === 'on',
+  NOTIFY_ON_HELD_AFTER_ATTEMPT:
+    (process.env.NOTIFY_ON_HELD_AFTER_ATTEMPT || 'off') === 'on',
+  NOTIFY_ON_INVESTIGATING: (process.env.NOTIFY_ON_INVESTIGATING || 'on') === 'on',
 
   // ── 異常の検知 ─────────────────────────────────────────────
   // 取得失敗がこの件数以上、またはこの割合以上になったら即座に通知する

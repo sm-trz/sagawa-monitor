@@ -146,9 +146,11 @@ function judge({
   }
 
   // ④ 保管中 → 配達を試みた記録があれば持ち帰り、無ければ配達前の一時保管
+  //    配達後の保管は「実データ1件」だけを根拠にした推定なので、
+  //    既定では記録のみにして通知しない（NOTIFY_ON_HELD_AFTER_ATTEMPT=on で戻せる）
   else if (status === '保管中') {
     if (attemptedDelivery) {
-      flag = FLAG_INVESTIGATE;
+      flag = config.NOTIFY_ON_HELD_AFTER_ATTEMPT ? FLAG_INVESTIGATE : FLAG_WATCH;
       notes.push('配達後の保管（持ち帰りとみなします）');
     } else {
       flag = FLAG_WATCH;
@@ -157,14 +159,18 @@ function judge({
   }
 
   // ⑤ 調査中 → 自動では判断できない。人が確認する。
+  //    佐川は返品を「返品」と表示せず、履歴ごと消えて調査中になる。
+  //    佐川の返品を拾える唯一の手がかりなので既定では通知する。
   else if (status === '調査中') {
-    flag = FLAG_INVESTIGATE;
+    flag = config.NOTIFY_ON_INVESTIGATING ? FLAG_INVESTIGATE : FLAG_WATCH;
     notes.push('配送会社が「調査中」。自動では判断できません');
   }
 
   // ⑥ 取得できなかった
+  //    配送会社のページが読めなかっただけで、委託者に打つ手がない。
+  //    既定では記録のみ（運用ルームへのシステム通知で十分）。
   else if (status === '取得失敗') {
-    flag = FLAG_INVESTIGATE;
+    flag = config.NOTIFY_ON_FETCH_ERROR ? FLAG_INVESTIGATE : FLAG_WATCH;
     notes.push('配送会社サイトから状況を読み取れませんでした');
   }
 
@@ -185,7 +191,9 @@ function judge({
     notes.push(`未知のステータス「${status}」`);
   }
 
-  if (deadline && flag === FLAG_INVESTIGATE) {
+  // 返送予定日は、通知しない場合でもシートに残しておく。
+  // 期限が見えていれば、あとから人が気づける。
+  if (deadline && (flag === FLAG_INVESTIGATE || flag === FLAG_WATCH)) {
     notes.push(
       deadline.daysLeft >= 0
         ? `返送予定 ${deadline.date}（あと${deadline.daysLeft}日）`

@@ -16,6 +16,7 @@ require('dotenv').config();
 
 const http = require('http');
 const { runMonitor } = require('./monitor');
+const { runDiagnostics } = require('./diag');
 const notifiers = require('./notifiers');
 const logger = require('./logger');
 const config = require('./config');
@@ -57,6 +58,7 @@ const server = http.createServer(async (req, res) => {
         run: 'GET /run （ブラウザ用） / POST /run （Cloud Scheduler 用）→ 本番ルームへ通知',
         runTest: 'GET /run?mode=test → テストルームへ通知',
         testNotify: 'GET /test-notify → シートを触らずテスト通知だけ送る',
+        diag: 'GET /diag → 配送会社のサイトに繋がるか調べる（シートも通知も触らない）',
         health: 'GET /health',
       },
       settings: {
@@ -64,12 +66,20 @@ const server = http.createServer(async (req, res) => {
         '監視を打ち切る日数': config.MAX_MONITOR_DAYS,
         '1回の最大照会件数': config.MAX_PER_RUN,
         '照会間隔ミリ秒': config.REQUEST_INTERVAL_MS,
+        'ページ表示待ち秒': config.PAGE_TIMEOUT_MS / 1000,
+        '照会のやり直し回数': config.SEARCH_ATTEMPTS,
         'ヤマトの文言判定': config.YAMATO_STATUS_JUDGE ? 'on' : 'off',
         '保管日数（佐川/ヤマト）': `${config.SAGAWA_HOLD_DAYS} / ${config.YAMATO_HOLD_DAYS}`,
         '照会を止めている会社': config.PAUSED_CARRIERS.length
           ? config.PAUSED_CARRIERS.join(' / ')
           : 'なし',
         '取得失敗の通知を見送る条件': `${config.FETCH_FAILURE_MUTE_MIN}件以上 かつ ${Math.round(config.FETCH_FAILURE_MUTE_RATIO * 100)}%以上`,
+        '委託者へ通知する判定': [
+          '持戻り', '長期不在', '返品確定',
+          config.NOTIFY_ON_INVESTIGATING ? '調査中' : null,
+          config.NOTIFY_ON_HELD_AFTER_ATTEMPT ? '保管中（配達後）' : null,
+          config.NOTIFY_ON_FETCH_ERROR ? '取得失敗' : null,
+        ].filter(Boolean).join(' / '),
         '通知': config.NOTIFY ? 'on' : 'off',
         '本番ルーム設定済み': Boolean(config.CHATWORK_ROOM_ID),
         'テストルーム設定済み': Boolean(config.CHATWORK_ROOM_ID_TEST),
@@ -79,6 +89,19 @@ const server = http.createServer(async (req, res) => {
       },
       running,
     });
+  }
+
+  // 原因切り分け用。シートにも通知にも一切触らない。
+  // 「配送会社のサイトに繋がらない」ときに、送信元IPが弾かれているのか
+  // ブラウザが弾かれているのかを見分けるために使う。
+  if (path === '/diag') {
+    try {
+      const result = await runDiagnostics();
+      return sendJson(res, 200, { status: 'ok', result });
+    } catch (err) {
+      logger.error('診断に失敗しました', { error: err.message, stack: err.stack });
+      return sendJson(res, 500, { status: 'error', message: err.message });
+    }
   }
 
   // 設定確認用。シートには一切触らず、テストルームへ1通だけ送る。

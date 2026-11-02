@@ -185,7 +185,7 @@ const jTransitOld = judge({ status: '輸送中', shipDate: '2026/08/01', carrier
 check('輸送中で22日経過 → 通知しないが記録は残す', jTransitOld.flag || '(なし)', '(なし)');
 
 const jHeld = judge({ status: '保管中', attemptedDelivery: true, heldAt: '2026/08/20 12:30', carrierName: '佐川', now: NOW });
-check('配達後の保管中 → 要調査', jHeld.flag, '要調査');
+check('配達後の保管中 → 経過観察（通知しない）', jHeld.flag, '経過観察');
 check('返送予定日（佐川8日）', jHeld.deadline.date, '2026/08/28');
 check('返送まで残り日数', String(jHeld.deadline.daysLeft), '5');
 
@@ -204,7 +204,7 @@ check('履歴に返品 → 返品確定', jReturned.flag, '返品確定');
 check('履歴に返品 → H列に「返品」と記録', jReturned.effectiveStatus, '返品');
 
 const jFail = judge({ status: '取得失敗', carrierName: '佐川', now: NOW });
-check('取得失敗 → 要調査', jFail.flag, '要調査');
+check('取得失敗 → 経過観察（通知しない）', jFail.flag, '経過観察');
 
 // お客様が日時を指定し直した状態。こちらが動く必要はないので通知しない
 const jChange = judge({ status: '変更受付', shipDate: '2026/08/20', carrierName: '佐川', now: NOW });
@@ -360,10 +360,119 @@ check('照会0件なら見送らない', shouldMuteFetchFailures(0, 0), false);
 
 // 見送っても「取得失敗」自体は記録に残す（事実を消さない）
 const jFailMuted = judge({ status: '取得失敗', carrierName: '佐川', now: NOW });
-check('取得失敗の判定そのものは変えない', jFailMuted.flag, '要調査');
+check('取得失敗は記録のみ（通知しない）', jFailMuted.flag, '経過観察');
 
-console.log('\n----------------------------------------');
-console.log(`  合格 ${passed} 件 / 不合格 ${failed} 件`);
-console.log('----------------------------------------\n');
+section('通知する判定の切り替え');
 
-process.exit(failed === 0 ? 0 : 1);
+// 設定は起動時に読み込まれるので、別プロセスを立ててから確認する
+const { execSync } = require('child_process');
+function flagWithEnv(env, args) {
+  const src = `const {judge}=require('./judge');console.log(judge(${JSON.stringify(args)}).flag);`;
+  return execSync(`node -e ${JSON.stringify(src)}`, {
+    env: { ...process.env, ...env },
+    cwd: __dirname,
+  }).toString().trim();
+}
+
+const FETCH_ERR = { status: '取得失敗', carrierName: '佐川' };
+const HELD_AFTER = { status: '保管中', attemptedDelivery: true, carrierName: '佐川' };
+const INVESTIGATING = { status: '調査中', carrierName: '佐川' };
+const MOCHIMODORI = { status: '持戻り', carrierName: 'ヤマト' };
+const RETURNED = { status: '返品', carrierName: 'ヤマト' };
+
+check('既定: 取得失敗は通知しない', flagWithEnv({}, FETCH_ERR), '経過観察');
+check('設定で通知に戻せる', flagWithEnv({ NOTIFY_ON_FETCH_ERROR: 'on' }, FETCH_ERR), '要調査');
+
+check('既定: 配達後の保管は通知しない', flagWithEnv({}, HELD_AFTER), '経過観察');
+check('設定で通知に戻せる', flagWithEnv({ NOTIFY_ON_HELD_AFTER_ATTEMPT: 'on' }, HELD_AFTER), '要調査');
+
+check('既定: 調査中は通知する', flagWithEnv({}, INVESTIGATING), '要調査');
+check('設定で止められる', flagWithEnv({ NOTIFY_ON_INVESTIGATING: 'off' }, INVESTIGATING), '経過観察');
+
+// 本物の検知は、どの設定でも必ず通知する
+const ALL_OFF = {
+  NOTIFY_ON_FETCH_ERROR: 'off',
+  NOTIFY_ON_HELD_AFTER_ATTEMPT: 'off',
+  NOTIFY_ON_INVESTIGATING: 'off',
+};
+check('持戻りは設定に関係なく通知', flagWithEnv(ALL_OFF, MOCHIMODORI), '要調査');
+check('返品確定は設定に関係なく通知', flagWithEnv(ALL_OFF, RETURNED), '返品確定');
+check('長期不在も通知', flagWithEnv(ALL_OFF, { status: '長期不在', carrierName: '佐川' }), '要調査');
+
+// 通知しなくなっても、返送予定日はシートに残す
+const jHeldNote = judge({
+  status: '保管中', attemptedDelivery: true,
+  heldAt: '2026/08/20 12:30', carrierName: '佐川', now: NOW,
+});
+check('通知しなくても返送予定を備考に残す',
+  String(jHeldNote.notes.some((n) => n.includes('返送予定'))), 'true');
+
+// ══════════════════════════════════════════════════════════
+section('再配達の依頼を「変更受付」として扱う');
+
+// 2026-11-03 実データ：お客様が再配達を依頼した状態。
+// 以前は「未知のステータス」になり、備考に警告が残っていた。
+check('依頼受付（再配達）', yamato.normalizeStatus('依頼受付（再配達）'), '変更受付');
+check('再配達受付', yamato.normalizeStatus('再配達受付'), '変更受付');
+check('日時変更受付は今までどおり', yamato.normalizeStatus('日時変更受付'), '変更受付');
+// 似ているが別物。取り違えないこと
+check('荷物受付は荷物受付のまま', yamato.normalizeStatus('荷物受付'), '荷物受付');
+check('持戻りは持戻りのまま', yamato.normalizeStatus('持戻り'), '持戻り');
+
+// 変更受付は「正常に配送が進んでいる」扱い。印すら付かない。
+// 以前は未知のステータス（経過観察＋警告の備考）になっていた。
+const jRedeliver = judge({ status: '変更受付', carrierName: 'ヤマト', now: NOW });
+check('変更受付は印を付けない', jRedeliver.flag === '' ? 'なし' : jRedeliver.flag, 'なし');
+check('変更受付に警告を残さない',
+  String(jRedeliver.notes.some((n) => n.includes('未知'))), 'false');
+
+// ══════════════════════════════════════════════════════════
+section('照会のやり直し');
+
+// searchWithRetry は withPage を通してブラウザを使うため、
+// ここでは「やり直しの回数と、最後に成功すれば結果を返すか」だけを
+// 同じ作りの小さな関数で確かめる。
+async function retryLike(attempts, failTimes) {
+  let calls = 0;
+  let lastError = null;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      calls++;
+      if (calls <= failTimes) throw new Error('page.goto: Timeout');
+      return { calls, result: 'ok' };
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  return { calls, result: `失敗: ${lastError.message}` };
+}
+
+(async () => {
+  const a = await retryLike(3, 0);
+  check('1回目で成功したら1回で終わる', `${a.calls}/${a.result}`, '1/ok');
+
+  const b = await retryLike(3, 2);
+  check('2回失敗しても3回目で成功する', `${b.calls}/${b.result}`, '3/ok');
+
+  const c = await retryLike(3, 5);
+  check('3回とも失敗したら諦める', `${c.calls}/${c.result}`, '3/失敗: page.goto: Timeout');
+
+  const d = await retryLike(1, 1);
+  check('やり直し1回設定なら1回で諦める', `${d.calls}/${d.result}`, '1/失敗: page.goto: Timeout');
+
+  // 設定が読み込めているか
+  check('やり直し回数の既定値', String(require('./config').SEARCH_ATTEMPTS >= 2), 'true');
+  check('ページ表示待ちの既定値（秒）', String(require('./config').PAGE_TIMEOUT_MS / 1000), '60');
+
+  // 診断エンドポイントが読み込めるか（通信はしない）
+  const diag = require('./diag');
+  check('診断の対象は2社', String(diag.TARGETS.length), '2');
+  check('診断にヤマトが入っている',
+    String(diag.TARGETS.some((t) => t.name === 'ヤマト')), 'true');
+
+  console.log('\n----------------------------------------');
+  console.log(`  合格 ${passed} 件 / 不合格 ${failed} 件`);
+  console.log('----------------------------------------\n');
+  process.exit(failed === 0 ? 0 : 1);
+})();
+
