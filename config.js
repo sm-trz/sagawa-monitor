@@ -140,6 +140,11 @@ module.exports = {
     (process.env.NOTIFY_ON_HELD_AFTER_ATTEMPT || 'off') === 'on',
   NOTIFY_ON_INVESTIGATING: (process.env.NOTIFY_ON_INVESTIGATING || 'on') === 'on',
 
+  // 持ち帰られたあと、お客様が再配達を依頼している荷物は通知しない。
+  // ただし返送予定日まであと何日かを切ったら通知に切り替える。
+  // 放っておくと保管期限切れで返品になってしまうため。
+  NOTIFY_BEFORE_RETURN_DAYS: num(process.env.NOTIFY_BEFORE_RETURN_DAYS, 2),
+
   // ── 異常の検知 ─────────────────────────────────────────────
   // 取得失敗がこの件数以上、またはこの割合以上になったら即座に通知する
   ERROR_ALERT_MIN_COUNT: num(process.env.ERROR_ALERT_MIN_COUNT, 3),

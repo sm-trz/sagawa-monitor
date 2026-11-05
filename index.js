@@ -80,6 +80,7 @@ const server = http.createServer(async (req, res) => {
           config.NOTIFY_ON_HELD_AFTER_ATTEMPT ? '保管中（配達後）' : null,
           config.NOTIFY_ON_FETCH_ERROR ? '取得失敗' : null,
         ].filter(Boolean).join(' / '),
+        '再配達の依頼があれば通知しない': `返送予定日まで${config.NOTIFY_BEFORE_RETURN_DAYS}日を切るまで`,
         '通知': config.NOTIFY ? 'on' : 'off',
         '本番ルーム設定済み': Boolean(config.CHATWORK_ROOM_ID),
         'テストルーム設定済み': Boolean(config.CHATWORK_ROOM_ID_TEST),
